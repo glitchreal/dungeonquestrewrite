@@ -86,6 +86,10 @@ Editing the list stops Auto Sell so partially typed names cannot cause a sale.
 Re-enable Auto Sell when finished. The list saves automatically in the same
 per-account config, including across teleports.
 
+**Keep legendary items** is enabled by default and saves per account. It excludes
+all legendary weapons, helmets, chests, and abilities from selling. Turn it off
+to include legendary items, subject to the other keep rules.
+
 Auto Sell covers every rarity for weapons, helmets, chests, and abilities. It
 retains up to two Universal Heals, including when only one exists, and preserves
 equipped, locked, and favorite items plus pending healer equipment. Gear is

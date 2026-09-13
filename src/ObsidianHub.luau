@@ -12,7 +12,7 @@ local C = {
     Enabled = false, Role = "Carry", Host = "", Carry = "", Alts = "",
     AutoJoin = true, AutoAccept = true, Hardcore = false, Whitelist = true,
     LevelKaitun = true, AutoBest = true, AutoSwitch = true, ProvisionHeals = true,
-    AutoHealer = false, AutoSell = false, KeepItems = "", AutoSkillPoints = false, UpgradeStat = "Stamina",
+    AutoHealer = false, AutoSell = false, KeepItems = "", KeepLegendary = true, AutoSkillPoints = false, UpgradeStat = "Stamina",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
     Distance = 20, SpellRange = 26, AutoDodge = true,
@@ -186,6 +186,7 @@ toggle(alt, "AutoSkillPoints", "Auto allocate skill points")
 dropdown(alt, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
 local inventory = settingsTab:AddLeftGroupbox("All account types")
 toggle(inventory, "AutoSell", "Auto sell all rarities", nil, "Works without role automation or party setup. Keeps two Universal Heals, equipped/locked/favorite items, and armor selected for the healer loadout.")
+toggle(inventory, "KeepLegendary", "Keep legendary items", nil, "Excludes every legendary weapon, helmet, chest, and ability from Auto Sell. Saved per account; enabled by default.")
 local keepItems = inventory:AddInput("KeepItems", {
     Text = "Keep items (full names, comma-separated)", Default = C.KeepItems,
     Finished = false, ClearTextOnFocus = false,

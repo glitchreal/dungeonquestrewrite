@@ -102,7 +102,7 @@ function Logic.keepNames(text)
     return keep
 end
 
-function Logic.sellPlan(inventory, protected, keepItems)
+function Logic.sellPlan(inventory, protected, keepItems, keepLegendary)
     local plan, count = { weapon = {}, helmet = {}, chest = {}, ability = {} }, 0
     local keep = {}
     local names = Logic.keepNames(keepItems)
@@ -111,7 +111,8 @@ function Logic.sellPlan(inventory, protected, keepItems)
         for id, item in pairs(inventory[kind == "ability" and "abilities" or kind .. "s"] or {}) do
             local number = tonumber(tostring(id):match("^" .. kind .. "_(%d+)$"))
             local equipped = Logic.isEquipped(item)
-            if number and not names[Logic.normalizeItemName(item.name)] and not equipped and not item.locked and not item.favorite and not item.favourited
+            local legendary = keepLegendary and Logic.normalizeItemName(item.rarity) == "legendary"
+            if not legendary and number and not names[Logic.normalizeItemName(item.name)] and not equipped and not item.locked and not item.favorite and not item.favourited
                 and not (kind == "ability" and keep[number]) and not (protected and protected[id]) then
                 table.insert(ids, number)
                 count = count + 1

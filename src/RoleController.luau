@@ -132,7 +132,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         if controller.SetAbilityInventory then controller.SetAbilityInventory(inv) end
         runtime.Heals[tostring(player.UserId)] = #Logic.heals(inv) >= 1
         if current() and config.AutoSell and not Adapter.value(player, "busyTrading", false) then
-            local plan, count = Logic.sellPlan(inv, protected, config.KeepItems)
+            local plan, count = Logic.sellPlan(inv, protected, config.KeepItems, config.KeepLegendary)
             if count == 0 then
                 state.sellStatus = "No eligible items | Verified sold: " .. state.sold
             elseif due("sell", 8, now) then
