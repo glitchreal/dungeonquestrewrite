@@ -172,7 +172,8 @@ toggle(alt, "AutoHealer", "Tank armor + Universal Heal only", nil, "Equips the h
 toggle(alt, "AutoSkillPoints", "Auto allocate skill points")
 dropdown(alt, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
 local inventory = settingsTab:AddLeftGroupbox("All account types")
-toggle(inventory, "AutoSell", "Auto sell all rarities", nil, "Keeps two Universal Heals, equipped/locked/favorite items, and armor selected for the healer loadout.")
+toggle(inventory, "AutoSell", "Auto sell all rarities", nil, "Works without role automation or party setup. Keeps two Universal Heals, equipped/locked/favorite items, and armor selected for the healer loadout.")
+local sellLabel = inventory:AddLabel("Auto sell: off", true)
 local display = settingsTab:AddRightGroupbox("Display and performance")
 toggle(display, "HideUI", "Hide UI on execute")
 toggle(display, "CPUSaver", "CPU saver", performance, "Disables 3D rendering, reduces effects, and caps FPS at 30. Restored when disabled or unloaded.")
@@ -237,6 +238,7 @@ task.spawn(function()
         local ok, err = xpcall(function() coordinator.Tick(os.clock()) end, debug.traceback)
         if not alive then break end
         if not ok then coordinator.Stop(); errors.Automation = tostring(err) else errors.Automation = nil end
+        sellLabel:SetText(coordinator.sellStatus)
         statusLabel:SetText(C.Role .. " · " .. coordinator.status)
         partyLabel:SetText(coordinator.party)
         levelLabel:SetText("Level: " .. tostring(Adapter.level() or "loading") .. " | " .. controller.State.status)

@@ -39,6 +39,15 @@ function Logic.sameDungeon(a, b)
     return a and b and a.Dungeon == b.Dungeon and a.Difficulty == b.Difficulty
 end
 
+-- Protect every equipped ability slot, including the game's q2/e2 slots.
+function Logic.isEquipped(item)
+    if type(item.equipped) == "table" then
+        for _, value in pairs(item.equipped) do if value ~= false then return true end end
+        return false
+    end
+    return item.equipped ~= false
+end
+
 function Logic.heals(inventory)
     local result = {}
     for id, item in pairs(inventory.abilities or {}) do
@@ -48,7 +57,7 @@ function Logic.heals(inventory)
     end
     table.sort(result, function(a, b)
         local function equipped(item)
-            return type(item.equipped) == "table" and (item.equipped.q or item.equipped.e) and 1 or 0
+            return Logic.isEquipped(item) and 1 or 0
         end
         local x, y = equipped(a.item), equipped(b.item)
         return x > y or x == y and a.id < b.id
@@ -86,7 +95,7 @@ function Logic.sellPlan(inventory, protected)
     for kind, ids in pairs(plan) do
         for id, item in pairs(inventory[kind == "ability" and "abilities" or kind .. "s"] or {}) do
             local number = tonumber(tostring(id):match("^" .. kind .. "_(%d+)$"))
-            local equipped = item.equipped == true or type(item.equipped) == "table" and (item.equipped.q or item.equipped.e)
+            local equipped = Logic.isEquipped(item)
             if number and not equipped and not item.locked and not item.favorite and not item.favourited
                 and not (kind == "ability" and keep[number]) and not (protected and protected[id]) then
                 table.insert(ids, number)

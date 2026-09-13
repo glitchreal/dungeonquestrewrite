@@ -22,7 +22,8 @@ the carry can be much higher level.
 
 Automation, auto sell, auto healer, auto skill points, and OCD recovery start
 disabled. Feature switches such as auto join and Level Kaitun are preset, but
-perform no actions until **Enable role automation** is on.
+perform no actions until **Enable role automation** is on. Auto Sell is independent:
+turning on its own toggle runs it even with role automation off or no party configured.
 
 | Role | Behavior |
 | --- | --- |
@@ -78,7 +79,10 @@ Auto Sell covers every rarity for weapons, helmets, chests, and abilities. It
 retains up to two Universal Heals, including when only one exists, and preserves
 equipped, locked, and favorite items plus pending healer equipment. Gear is
 refreshed after equipping before a sale is computed. Trading pauses inventory
-mutations. Auto Sell is intentionally opt-in on each account.
+mutations. All equipped ability slots, including Q2/E2, are protected; unknown
+equipped status is also kept. The sale readout distinguishes requests from items
+confirmed removed by the next inventory scan. Auto Sell is intentionally opt-in
+on each account and requires neither party setup nor dungeon catalog loading.
 
 ## Settings and execution
 

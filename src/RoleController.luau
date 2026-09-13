@@ -3,7 +3,7 @@ local Roles = {}
 function Roles.new(config, runtime, mode, controller, save, isAlive)
     local player = game:GetService("Players").LocalPlayer
     local Players = game:GetService("Players")
-    local state = { status = "Disabled", party = "Configure host, carry, and alts", farming = false,
+    local state = { sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
         finished = false, finishedAt = nil, missingAt = nil, readyAt = nil, returning = false, requests = {} }
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
     local rosterKey, catalogReady = nil, false
@@ -12,7 +12,8 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
     runtime.Heals = runtime.Heals or {}
     runtime.Levels = runtime.Levels or {}
     local revision, tickRevision = 0, 0
-    local function active() return isAlive() and config.Enabled and revision == tickRevision end
+    local function current() return isAlive() and revision == tickRevision end
+    local function active() return current() and config.Enabled end
     local function due(key, seconds, now)
         if now - (times[key] or -math.huge) < seconds then return false end
         times[key] = now
@@ -67,12 +68,40 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         return pirate or Logic.bestDungeon(runtime.Catalog, level, false)
     end
     local function inventoryWork(now)
-        if not (config.AutoSell or config.Role == "Alt" and config.AutoHealer) or not due("inventory", 8, now) then return end
-        if Adapter.value(player, "busyTrading", false) then return end
+        if not config.AutoSell then state.sellStatus = "Auto sell: off" end
+        local equipHealer = active() and config.Role == "Alt" and config.AutoHealer
+        if not (config.AutoSell or equipHealer) or not due("inventory", state.pendingSale and 2 or 8, now) then return end
+        if Adapter.value(player, "busyTrading", false) then
+            if config.AutoSell then state.sellStatus = "Auto sell: paused while trading" end
+            return
+        end
+        if config.AutoSell then state.sellStatus = "Auto sell: reading inventory" end
         local inv = Adapter.inventory()
-        if not active() then return end
+        if not current() then return end
+        local unconfirmed = 0
+        if state.pendingSale then
+            local remaining, removed = {}, 0
+            for category, items in pairs(inv) do
+                if type(items) == "table" then
+                    for id, item in pairs(items) do
+                        if type(item) == "table" then remaining[category .. ":" .. tostring(item.UniqueItemID or id)] = true end
+                    end
+                end
+            end
+            for _, identity in ipairs(state.pendingSale) do
+                if remaining[identity] then unconfirmed = unconfirmed + 1 else removed = removed + 1 end
+            end
+            state.sold = state.sold + removed
+            state.pendingSale = nil
+        end
         local protected = {}
+        -- Preserve planned tank gear even when only standalone selling is enabled.
         if config.Role == "Alt" and config.AutoHealer then
+            for _, entry in ipairs(Logic.tankArmor(inv, assert(Adapter.level()))) do
+                protected[entry.kind .. "_" .. entry.id] = true
+            end
+        end
+        if equipHealer then
             local tank = Logic.tankArmor(inv, assert(Adapter.level()))
             for _, entry in ipairs(tank) do
                 protected[entry.kind .. "_" .. entry.id] = true
@@ -102,9 +131,26 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         end
         if controller.SetAbilityInventory then controller.SetAbilityInventory(inv) end
         runtime.Heals[tostring(player.UserId)] = #Logic.heals(inv) >= 1
-        if active() and config.AutoSell and not Adapter.value(player, "busyTrading", false) then
+        if current() and config.AutoSell and not Adapter.value(player, "busyTrading", false) then
             local plan, count = Logic.sellPlan(inv, protected)
-            if count > 0 then Adapter.call("sellItemEvent", plan) end
+            if count == 0 then
+                state.sellStatus = "No eligible items | Verified sold: " .. state.sold
+            elseif due("sell", 8, now) then
+                local pending = {}
+                for kind, ids in pairs(plan) do
+                    local category = kind == "ability" and "abilities" or kind .. "s"
+                    for _, id in ipairs(ids) do
+                        local key = kind .. "_" .. id
+                        table.insert(pending, category .. ":" .. tostring(inv[category][key].UniqueItemID or key))
+                    end
+                end
+                Adapter.call("sellItemEvent", plan)
+                state.pendingSale = pending
+                state.sellStatus = "Requested " .. count .. " items | Verified sold: " .. state.sold
+            else
+                state.sellStatus = unconfirmed > 0 and ("Sale not confirmed for " .. unconfirmed .. " items; waiting to retry")
+                    or (count .. " eligible items | Verified sold: " .. state.sold)
+            end
         end
     end
     local function processRequests(now)
@@ -141,11 +187,18 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
     function state.Stop() revision = revision + 1; stop() end
     function state.Tick(now)
         tickRevision = revision
+        if not isAlive() then return end
+        if not Adapter.level() then
+            stop(); state.status = "Waiting for player data"
+            state.sellStatus = config.AutoSell and "Auto sell: waiting for player data" or "Auto sell: off"
+            return
+        end
+        -- Inventory tools must not depend on a valid party or dungeon catalog.
+        inventoryWork(now)
         if not active() then
             stop(); state.status = "Disabled"; state.missingAt, state.readyAt, state.returning = nil, nil, false
             return
         end
-        if not Adapter.level() then stop(); state.status = "Waiting for player data"; return end
         if not configure() then return end
         if mode == "Lobby" and not catalogReady then
             local catalog = Adapter.catalog()
@@ -153,7 +206,6 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             runtime.Catalog, catalogReady = catalog, true
             save()
         end
-        inventoryWork(now)
         if not active() then return end
         if config.Role == "Alt" and config.AutoSkillPoints and due("points", 3, now) then
             local points = Adapter.value(player, "skillPoints", 0)
