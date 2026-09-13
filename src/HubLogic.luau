@@ -88,15 +88,30 @@ function Logic.tankArmor(inventory, level)
     return result
 end
 
-function Logic.sellPlan(inventory, protected)
+function Logic.normalizeItemName(name)
+    return tostring(name or ""):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+end
+
+function Logic.keepNames(text)
+    local keep = {}
+    -- Spaces belong to item names; only rows, commas, or semicolons separate items.
+    for name in (text or ""):gmatch("[^,;\r\n]+") do
+        name = Logic.normalizeItemName(name)
+        if name ~= "" then keep[name] = true end
+    end
+    return keep
+end
+
+function Logic.sellPlan(inventory, protected, keepItems)
     local plan, count = { weapon = {}, helmet = {}, chest = {}, ability = {} }, 0
     local keep = {}
+    local names = Logic.keepNames(keepItems)
     for index, heal in ipairs(Logic.heals(inventory)) do if index <= 2 then keep[heal.id] = true end end
     for kind, ids in pairs(plan) do
         for id, item in pairs(inventory[kind == "ability" and "abilities" or kind .. "s"] or {}) do
             local number = tonumber(tostring(id):match("^" .. kind .. "_(%d+)$"))
             local equipped = Logic.isEquipped(item)
-            if number and not equipped and not item.locked and not item.favorite and not item.favourited
+            if number and not names[Logic.normalizeItemName(item.name)] and not equipped and not item.locked and not item.favorite and not item.favourited
                 and not (kind == "ability" and keep[number]) and not (protected and protected[id]) then
                 table.insert(ids, number)
                 count = count + 1

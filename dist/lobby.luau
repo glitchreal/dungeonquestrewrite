@@ -95,15 +95,30 @@ function Logic.tankArmor(inventory, level)
     return result
 end
 
-function Logic.sellPlan(inventory, protected)
+function Logic.normalizeItemName(name)
+    return tostring(name or ""):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+end
+
+function Logic.keepNames(text)
+    local keep = {}
+    -- Spaces belong to item names; only rows, commas, or semicolons separate items.
+    for name in (text or ""):gmatch("[^,;\r\n]+") do
+        name = Logic.normalizeItemName(name)
+        if name ~= "" then keep[name] = true end
+    end
+    return keep
+end
+
+function Logic.sellPlan(inventory, protected, keepItems)
     local plan, count = { weapon = {}, helmet = {}, chest = {}, ability = {} }, 0
     local keep = {}
+    local names = Logic.keepNames(keepItems)
     for index, heal in ipairs(Logic.heals(inventory)) do if index <= 2 then keep[heal.id] = true end end
     for kind, ids in pairs(plan) do
         for id, item in pairs(inventory[kind == "ability" and "abilities" or kind .. "s"] or {}) do
             local number = tonumber(tostring(id):match("^" .. kind .. "_(%d+)$"))
             local equipped = Logic.isEquipped(item)
-            if number and not equipped and not item.locked and not item.favorite and not item.favourited
+            if number and not names[Logic.normalizeItemName(item.name)] and not equipped and not item.locked and not item.favorite and not item.favourited
                 and not (kind == "ability" and keep[number]) and not (protected and protected[id]) then
                 table.insert(ids, number)
                 count = count + 1
@@ -520,7 +535,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         if controller.SetAbilityInventory then controller.SetAbilityInventory(inv) end
         runtime.Heals[tostring(player.UserId)] = #Logic.heals(inv) >= 1
         if current() and config.AutoSell and not Adapter.value(player, "busyTrading", false) then
-            local plan, count = Logic.sellPlan(inv, protected)
+            local plan, count = Logic.sellPlan(inv, protected, config.KeepItems)
             if count == 0 then
                 state.sellStatus = "No eligible items | Verified sold: " .. state.sold
             elseif due("sell", 8, now) then
@@ -735,7 +750,7 @@ local C = {
     Enabled = false, Role = "Carry", Host = "", Carry = "", Alts = "",
     AutoJoin = true, AutoAccept = true, Hardcore = false, Whitelist = true,
     LevelKaitun = true, AutoBest = true, AutoSwitch = true, ProvisionHeals = true,
-    AutoHealer = false, AutoSell = false, AutoSkillPoints = false, UpgradeStat = "Stamina",
+    AutoHealer = false, AutoSell = false, KeepItems = "", AutoSkillPoints = false, UpgradeStat = "Stamina",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
     Distance = 20, SpellRange = 26, AutoDodge = true,
@@ -896,6 +911,17 @@ toggle(alt, "AutoSkillPoints", "Auto allocate skill points")
 dropdown(alt, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
 local inventory = settingsTab:AddLeftGroupbox("All account types")
 toggle(inventory, "AutoSell", "Auto sell all rarities", nil, "Works without role automation or party setup. Keeps two Universal Heals, equipped/locked/favorite items, and armor selected for the healer loadout.")
+local keepItems = inventory:AddInput("KeepItems", {
+    Text = "Keep items (full names, comma-separated)", Default = C.KeepItems,
+    Finished = false, ClearTextOnFocus = false,
+    Tooltip = "Enter full item names, separated by commas, semicolons, or pasted lines. Matches ignore capitalization and extra spaces. Every matching copy is kept. Editing stops Auto Sell; re-enable it when finished.",
+})
+keepItems:OnChanged(function(value)
+    -- Do not sell while an item name is only partially typed.
+    if C.AutoSell then controls.AutoSell:SetValue(false) end
+    change("KeepItems", value)
+end)
+controls.KeepItems = keepItems
 local sellLabel = inventory:AddLabel("Auto sell: off", true)
 local display = settingsTab:AddRightGroupbox("Display and performance")
 toggle(display, "HideUI", "Hide UI on execute")

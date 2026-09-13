@@ -75,6 +75,14 @@ Auto Healer toggle alternates ready Q/E heals with at least four seconds between
 casts, while still waiting for each skill's real cooldown and a party member to
 need healing. One owned heal also respects its cooldown; no extra toggle is needed.
 
+Under Settings → All account types, **Keep items** accepts full item names
+separated by commas, semicolons, or pasted lines, for example
+`Enhanced Inner Focus, Enhanced Inner Rage`. Matching ignores capitalization and
+extra spaces but requires the entire name; every matching copy is protected.
+Editing the list stops Auto Sell so partially typed names cannot cause a sale.
+Re-enable Auto Sell when finished. The list saves automatically in the same
+per-account config, including across teleports.
+
 Auto Sell covers every rarity for weapons, helmets, chests, and abilities. It
 retains up to two Universal Heals, including when only one exists, and preserves
 equipped, locked, and favorite items plus pending healer equipment. Gear is
