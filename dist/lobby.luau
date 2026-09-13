@@ -24,6 +24,18 @@ function Logic.tokens(text)
     return result
 end
 
+function Logic.accountRole(party, username, userId)
+    local function matches(value)
+        for _, token in ipairs(Logic.tokens(value)) do
+            if token:lower() == username:lower() or tonumber(token) == userId then return true end
+        end
+        return false
+    end
+    if matches(party.Host) then return "Host" end
+    if matches(party.Carry) then return "Carry" end
+    if matches(party.Alts) then return "Alt" end
+end
+
 function Logic.bestDungeon(catalog, level, pirateOnly)
     local best
     for name, stats in pairs(catalog) do
@@ -763,6 +775,19 @@ local C = {
     HideUI = false, CPUSaver = false, Waypoints = false,
     Distance = 20, SpellRange = 26, AutoDodge = true,
 }
+local defaults = table.clone(C)
+local partyPath = "DungeonQuestRewrite-party.json"
+local function profilePath(role) return "DungeonQuestRewrite-role-" .. role .. ".json" end
+local function readShared(path)
+    if type(readfile) ~= "function" then return nil end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
+    if ok and type(data) == "table" and data.Version == 1 then return data end
+end
+local function applyValues(values)
+    for key, value in pairs(type(values) == "table" and values or {}) do
+        if defaults[key] ~= nil and type(value) == type(defaults[key]) then C[key] = value end
+    end
+end
 local runtime, menuKey = {}, "RightShift"
 if env.autoloadconfig ~= false then
     local saved = resume
@@ -776,6 +801,24 @@ if env.autoloadconfig ~= false then
         end
         if type(saved.Runtime) == "table" then runtime = saved.Runtime end
         if type(saved.MenuKey) == "string" then menuKey = saved.MenuKey end
+    end
+end
+if env.autoloadconfig ~= false then
+    local shared = readShared(partyPath)
+    local party = shared and type(shared.Party) == "table" and shared.Party or table.clone(C)
+    local detected = Logic.accountRole(party, player.Name, player.UserId)
+    if detected then
+        local profile = readShared(profilePath(detected))
+        if profile and type(profile.Config) == "table" then
+            applyValues(profile.Config)
+            if type(profile.MenuKey) == "string" then menuKey = profile.MenuKey end
+        elseif C.Role ~= detected then
+            applyValues(defaults)
+        end
+        C.Role = detected
+    end
+    for _, key in ipairs({ "Host", "Carry", "Alts" }) do
+        if type(party[key]) == "string" then C[key] = party[key] end
     end
 end
 if not table.find({ "Carry", "Host", "Alt" }, C.Role) then C.Role = "Carry"; C.Enabled = false end
@@ -792,6 +835,8 @@ Library.Scheme.AccentColor = Color3.fromRGB(63, 205, 134)
 local controller = createController()
 local alive, hooks, controls, errors = true, {}, {}, {}
 local coordinator
+local editingParty = false
+local partyInputs = {}
 local previousFPS = type(getfpscap) == "function" and getfpscap() or nil
 local performanceApplied = false
 local patches = setmetatable({}, { __mode = "k" })
@@ -801,6 +846,10 @@ local function connect(signal, callback)
     table.insert(hooks, connection)
 end
 local function snapshot()
+    -- A teleport/unload can run before Roblox dispatches the last text-change event.
+    for key, box in pairs(partyInputs) do
+        if box.Parent then C[key] = box.Text end
+    end
     return { Version = 2, Config = C, Runtime = runtime, MenuKey = menuKey }
 end
 local function save()
@@ -808,6 +857,25 @@ local function save()
     local ok = pcall(function() writefile(configPath, HttpService:JSONEncode(snapshot())) end)
     errors.Save = not ok and "Could not save settings" or nil
 end
+local function publishProfile(partyKey)
+    if type(writefile) ~= "function" then return end
+    local ok = pcall(function()
+        -- Separate role files avoid carry/host/alt saves replacing each other's profiles.
+        if Logic.accountRole(C, player.Name, player.UserId) == C.Role then
+            writefile(profilePath(C.Role), HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey }))
+        end
+        local shared = readShared(partyPath)
+        local party = shared and type(shared.Party) == "table" and shared.Party or { Host = C.Host, Carry = C.Carry, Alts = C.Alts }
+        if partyKey then party[partyKey] = C[partyKey] end
+        if partyKey or not shared then
+            writefile(partyPath, HttpService:JSONEncode({ Version = 1, Party = party }))
+        end
+    end)
+    errors.Profile = not ok and "Could not save shared role profile" or nil
+end
+-- Seed profiles from existing account settings without replacing a shared profile.
+if env.autoloadconfig ~= false and Logic.accountRole(C, player.Name, player.UserId) == C.Role
+    and not readShared(profilePath(C.Role)) then publishProfile() end
 local function notify(text) identity(); Library:Notify({ Title = "Dungeon Quest Rewrite", Description = text, Time = 5 }) end
 local function patch(instance, property, value)
     patches[instance] = patches[instance] or {}
@@ -853,6 +921,8 @@ local function change(key, value, callback)
     C[key] = value
     if coordinator then coordinator.Stop() end
     save()
+    -- Shared profiles publish only on user edits, not periodic/runtime saves.
+    publishProfile((key == "Host" or key == "Carry" or key == "Alts") and key or nil)
     if callback then callback(value) end
 end
 local function toggle(group, key, text, callback, tooltip)
@@ -861,18 +931,22 @@ local function toggle(group, key, text, callback, tooltip)
     controls[key] = control
 end
 local function input(group, key, text, normalize, tooltip)
-    local control = group:AddInput(key, { Text = text, Default = C[key], Finished = true, ClearTextOnFocus = false, Tooltip = tooltip })
+    local control = group:AddInput(key, { Text = text, Default = C[key], Finished = false, ClearTextOnFocus = false, Tooltip = tooltip })
     control:OnChanged(function(value)
-        local formatted = normalize and normalize(value) or value
-        if formatted ~= value then control:SetValue(formatted); return end
-        change(key, formatted)
+        -- Save drafts without stripping separators while the user is still typing.
+        change(key, value)
     end)
     controls[key] = control
     local box = control.Holder and control.Holder:FindFirstChildOfClass("TextBox")
     if box then
-        -- Obsidian's Finished input only commits on Enter by default.
-        connect(box.FocusLost, function(enterPressed)
-            if not enterPressed then control:SetValue(box.Text) end
+        partyInputs[key] = box
+        connect(box.Focused, function()
+            editingParty = true
+            if coordinator then coordinator.Stop() end
+        end)
+        connect(box.FocusLost, function()
+            control:SetValue(normalize and normalize(box.Text) or box.Text)
+            editingParty = false
         end)
     end
 end
@@ -900,7 +974,7 @@ input(setup, "Carry", "Carry username or user ID")
 input(setup, "Alts", "Selected alts (paste list)", function(value)
     return table.concat(Logic.tokens(value), ", ")
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
-setup:AddLabel("Use the same party list on every account. Host and alts level together; carry is excluded from level matching.", true)
+setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
@@ -913,6 +987,7 @@ local statusLabel = status:AddLabel("Off — enable automation at the top of Par
 local partyLabel = status:AddLabel("Configure the selected accounts", true)
 local levelLabel = status:AddLabel("Level: loading", true)
 local errorLabel = status:AddLabel("", true)
+local saveLabel = status:AddLabel("Settings for " .. player.Name, true)
 local carry = roleTab:AddLeftGroupbox("1 · Carry")
 toggle(carry, "LevelKaitun", "Level Kaitun: wait, start, and farm", nil, "Carry farms only with the entire selected party present. Keep this on for the host too so it can start on owner-only servers.")
 slider(carry, "Distance", "Combat distance", 5, 55)
@@ -954,7 +1029,7 @@ local queueTeleport = queue_on_teleport or queueonteleport or (syn and syn.queue
 menu:AddLabel("Teleport continuation: " .. (type(queueTeleport) == "function" and "available" or "rerun loader after teleport"), true)
 menu:AddLabel("Menu key"):AddKeyPicker("MenuKey", { Default = menuKey, NoUI = true, Text = "Menu" })
 Library.ToggleKeybind = Library.Options.MenuKey
-Library.Options.MenuKey:OnChanged(function() menuKey = Library.Options.MenuKey.Value; save() end)
+Library.Options.MenuKey:OnChanged(function() menuKey = Library.Options.MenuKey.Value; save(); publishProfile() end)
 local function unload()
     if not alive then return end
     save(); alive = false
@@ -1006,7 +1081,12 @@ task.spawn(function()
         cfg.COMBAT_DISTANCE, cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = C.Distance, math.max(0, C.Distance - 3), C.Distance + 3
         cfg.SPELL_RANGE_OVERRIDE, cfg.AUTO_DODGE = C.SpellRange, C.AutoDodge
         cfg.AUTO_ABILITIES = C.Role == "Carry"
-        local ok, err = xpcall(function() coordinator.Tick(os.clock()) end, debug.traceback)
+        local ok, err = xpcall(function()
+            if editingParty then
+                coordinator.Stop()
+                coordinator.status = "Paused while editing party fields"
+            else coordinator.Tick(os.clock()) end
+        end, debug.traceback)
         if not alive then break end
         if not ok then
             coordinator.Stop()
@@ -1014,6 +1094,7 @@ task.spawn(function()
             local reason = tostring(err):match("^[^\n]+") or "Unknown error"
             coordinator.status = "Blocked: " .. reason:gsub("^.-:%d+: ", "")
         else errors.Automation = nil end
+        saveLabel:SetText(errors.Save or errors.Profile or ("Profile: " .. C.Role .. " | Account: " .. player.Name))
         roleStatusLabel:SetText(C.Role .. " · " .. coordinator.status)
         sellLabel:SetText(coordinator.sellStatus)
         statusLabel:SetText(C.Role .. " · " .. coordinator.status)

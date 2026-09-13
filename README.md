@@ -18,8 +18,10 @@ press Enter or click away. The field formats it with commas and removes duplicat
 User IDs also work; display names do not. Select each account's
 role, choose its options, then use **Enable role automation** at the top of Party
 or **Start selected role** at the top of Roles. Dungeon creation requires the
-**Host** role; Carry and Alt send join requests instead. Text fields also save
-when you click away, so Enter is optional. The host and carry must
+**Host** role; Carry and Alt send join requests instead. Party fields save as
+you type, and the visible text is captured again before reload/unload/teleport.
+Role automation pauses while you edit the party to avoid using partial usernames.
+Click away to resume; Enter is optional. The host and carry must
 be different accounts. The host and selected alts should begin at the same level;
 the carry can be much higher level.
 
@@ -101,10 +103,26 @@ on each account and requires neither party setup nor dungeon catalog loading.
 
 ## Settings and execution
 
-Settings are stored separately per Roblox user ID in
-`DungeonQuestRewrite-<userId>.json`. This also retains observed levels, heal
-ownership, and the dungeon catalog for teleport continuation. Old hub configs
-are not imported. `autoloadconfig = false` starts with defaults.
+Settings use shared **Carry**, **Host**, and **Alt** profiles. On execution, the
+script matches the current Roblox username or UserId against the shared Host,
+Carry, and Selected alts fields, then loads that role's saved settings. All listed
+alts load the Alt profile. Unlisted accounts retain their own saved settings
+until configured. Reload an account after changing the shared party/profile.
+
+Files in the executor workspace:
+
+- `DungeonQuestRewrite-party.json`: shared Host, Carry, and Selected alts.
+- `DungeonQuestRewrite-role-Carry.json`, `-Host.json`, `-Alt.json`: settings per role.
+- `DungeonQuestRewrite-<userId>.json`: account fallback and runtime observations.
+
+Role profiles publish on user edits. Periodic saves and teleports update only the
+account file, so idle accounts do not overwrite shared settings. An existing
+account config seeds a missing role profile when its party identifies that account.
+Party text saves while typing and is captured again before unload/teleport.
+Role automation pauses during party edits to avoid using unfinished usernames.
+Accounts must share the executor's file workspace to share profiles; the same HWID
+alone does not make separate executor folders share files. `autoloadconfig = false`
+starts with defaults and skips shared profiles too.
 
 Right Shift toggles the Obsidian menu; the key is configurable. Hide UI applies
 on execution. CPU saver disables 3D rendering, caps FPS at 30, and reduces visual

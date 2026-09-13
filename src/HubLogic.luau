@@ -17,6 +17,18 @@ function Logic.tokens(text)
     return result
 end
 
+function Logic.accountRole(party, username, userId)
+    local function matches(value)
+        for _, token in ipairs(Logic.tokens(value)) do
+            if token:lower() == username:lower() or tonumber(token) == userId then return true end
+        end
+        return false
+    end
+    if matches(party.Host) then return "Host" end
+    if matches(party.Carry) then return "Carry" end
+    if matches(party.Alts) then return "Alt" end
+end
+
 function Logic.bestDungeon(catalog, level, pirateOnly)
     local best
     for name, stats in pairs(catalog) do
