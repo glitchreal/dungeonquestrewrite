@@ -129,8 +129,33 @@ function Adapter.currentDungeon()
 end
 
 function Adapter.ownerId()
+    -- Join-request arrivals may omit the original owner in teleport data.
+    -- The server's active owner is authoritative, including ownership changes.
+    local active = tonumber(RS:GetAttribute("ActiveDungeonOwnerId"))
+    if active and active > 0 then return active end
+    if type(PM.GetDungeonOwnerId) == "function" then
+        local id = tonumber(PM.GetDungeonOwnerId())
+        if id and id > 0 then return id end
+    end
     local teleport = PM.GetPlaceTeleportData()
-    return teleport and tonumber(teleport.ownerId)
+    local id = teleport and (tonumber(teleport.ownerId)
+        or type(teleport.dungeonStats) == "table" and tonumber(teleport.dungeonStats.ownerId))
+    return id and id > 0 and id or nil
+end
+
+function Adapter.pendingRequests()
+    local pending = {}
+    for _, gui in ipairs(player.PlayerGui:GetChildren()) do
+        local id = gui.Name:match("^joinRequestConfirm_(.+)$")
+        if id and gui:IsA("ScreenGui") and gui.Enabled then
+            local frame = gui:FindFirstChild("Frame")
+            local body = frame and frame:FindFirstChild("Frame")
+            local status = body and body:FindFirstChild("status")
+            local name = status and Logic.requestUsername(status.Text)
+            if name then table.insert(pending, { id = tonumber(id) or id, name = name, prompt = gui }) end
+        end
+    end
+    return pending
 end
 
 function Adapter.failed()

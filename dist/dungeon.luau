@@ -24,6 +24,12 @@ function Logic.tokens(text)
     return result
 end
 
+function Logic.requestUsername(text)
+    if type(text) ~= "string" then return nil end
+    return text:match("^([%w_]+) %(LVL %d+%) wants to join your raid%.$")
+        or text:match("^([%w_]+) wants to join your raid%.$")
+end
+
 function Logic.accountRole(party, username, userId)
     local function matches(value)
         for _, token in ipairs(Logic.tokens(value)) do
@@ -290,8 +296,33 @@ function Adapter.currentDungeon()
 end
 
 function Adapter.ownerId()
+    -- Join-request arrivals may omit the original owner in teleport data.
+    -- The server's active owner is authoritative, including ownership changes.
+    local active = tonumber(RS:GetAttribute("ActiveDungeonOwnerId"))
+    if active and active > 0 then return active end
+    if type(PM.GetDungeonOwnerId) == "function" then
+        local id = tonumber(PM.GetDungeonOwnerId())
+        if id and id > 0 then return id end
+    end
     local teleport = PM.GetPlaceTeleportData()
-    return teleport and tonumber(teleport.ownerId)
+    local id = teleport and (tonumber(teleport.ownerId)
+        or type(teleport.dungeonStats) == "table" and tonumber(teleport.dungeonStats.ownerId))
+    return id and id > 0 and id or nil
+end
+
+function Adapter.pendingRequests()
+    local pending = {}
+    for _, gui in ipairs(player.PlayerGui:GetChildren()) do
+        local id = gui.Name:match("^joinRequestConfirm_(.+)$")
+        if id and gui:IsA("ScreenGui") and gui.Enabled then
+            local frame = gui:FindFirstChild("Frame")
+            local body = frame and frame:FindFirstChild("Frame")
+            local status = body and body:FindFirstChild("status")
+            local name = status and Logic.requestUsername(status.Text)
+            if name then table.insert(pending, { id = tonumber(id) or id, name = name, prompt = gui }) end
+        end
+    end
+    return pending
 end
 
 function Adapter.failed()
@@ -420,7 +451,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
     local player = game:GetService("Players").LocalPlayer
     local Players = game:GetService("Players")
     local state = { sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
-        finished = false, finishedAt = nil, missingAt = nil, readyAt = nil, returning = false, requests = {} }
+        finished = false, finishedAt = nil, missingAt = nil, readyAt = nil, returning = false, requests = {}, responded = {} }
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
     local rosterKey, catalogReady = nil, false
     local healer = mode == "Dungeon" and AbilityController.new(player, function() end) or nil
@@ -570,8 +601,17 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         end
     end
     local function processRequests(now)
+        if config.Role ~= "Host" or not config.AutoAccept or Adapter.PlaceManager.HasDungeonStarted() then return end
+        -- Recover prompts whose showJoinRequest event fired before this script loaded.
+        if due("requestScan", 1, now) then
+            for _, pending in ipairs(Adapter.pendingRequests()) do
+                if not state.requests[pending.id] and now - (state.responded[pending.id] or -math.huge) >= 5 then
+                    state.requests[pending.id] = { name = pending.name, at = now, prompt = pending.prompt }
+                end
+            end
+        end
         for id, request in pairs(state.requests) do
-            if now - request.at > 45 then state.requests[id] = nil
+            if now - request.at > 45 or request.prompt and not request.prompt.Parent then state.requests[id] = nil
             elseif config.Role == "Host" and config.AutoAccept and not Adapter.PlaceManager.HasDungeonStarted() then
                 local allowed = false
                 for _, account in ipairs(roster) do
@@ -579,6 +619,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
                 end
                 if active() and Adapter.ownerId() == host.id then
                     Adapter.call("respondJoinRequest", id, allowed)
+                    state.responded[id] = now
                     state.requests[id] = nil
                 end
             end
@@ -676,9 +717,13 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             end
             return
         end
-        assert(next(runtime.Catalog), "Dungeon catalog unavailable; return to lobby once with automation enabled")
-        assert(Adapter.ownerId() == host.id, "This dungeon belongs to another host; return to lobby")
+        local ownerId = Adapter.ownerId()
+        if not ownerId then
+            stop(); state.status = "Waiting for dungeon owner data"; return
+        end
+        assert(ownerId == host.id, "Dungeon owner ID " .. ownerId .. " does not match selected host " .. host.name .. " (" .. host.id .. ")")
         processRequests(now)
+        assert(next(runtime.Catalog), "Dungeon catalog unavailable; return to lobby once with automation enabled")
         if not active() then return end
         local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
         state.party = ready and (equal and "Party present; host and alts at the same level" or "Party present; waiting for levels to match")

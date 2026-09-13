@@ -17,6 +17,12 @@ function Logic.tokens(text)
     return result
 end
 
+function Logic.requestUsername(text)
+    if type(text) ~= "string" then return nil end
+    return text:match("^([%w_]+) %(LVL %d+%) wants to join your raid%.$")
+        or text:match("^([%w_]+) wants to join your raid%.$")
+end
+
 function Logic.accountRole(party, username, userId)
     local function matches(value)
         for _, token in ipairs(Logic.tokens(value)) do

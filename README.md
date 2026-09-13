@@ -47,12 +47,17 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
   later content; special event and boss-key dungeons are excluded.
 - Hardcore and private/whitelist lobby mode are optional host settings. Automatic
   request acceptance **always** checks the selected party, even in a public lobby.
+  The host scans existing request prompts once per second as well as listening for
+  new requests, so requests received before the script loaded are recovered.
+  Unresolved prompts are retried at most once every five seconds.
 - Before starting, every selected account must be in the same dungeon and have a
   readable level. The configurable party-ready delay gives arrivals time to settle.
 - At the end of a run, switching waits five seconds for rewards, verifies the host's
   current level, and requires every selected non-carry account to match it. The host
   returns to create the new dungeon; carry/alt accounts return and request the host
   again. Enable Auto Best on the host and Auto Switch on the carry/alts.
+- Ownership checks use the server-replicated active owner first, then the game
+  owner API and teleport data. Missing owner data means wait, not a wrong-host error.
 - A host disappearing is **not** treated as a level unlock. With OCD disabled, the
   carry pauses and waits. With OCD enabled on every account, a missing/loading party
   member for the grace period sends the remaining accounts back to the lobby to
