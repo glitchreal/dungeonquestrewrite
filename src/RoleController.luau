@@ -10,6 +10,11 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
     local healer = mode == "Dungeon" and AbilityController.new(player, function() end) or nil
     runtime.Catalog = runtime.Catalog or {}
     runtime.Heals = runtime.Heals or {}
+    -- Previous releases stored booleans for the old one-heal target. Reinspect
+    -- those accounts instead of treating an old true as two owned heals.
+    for id, count in pairs(runtime.Heals) do
+        if type(count) ~= "number" then runtime.Heals[id] = nil end
+    end
     runtime.Levels = runtime.Levels or {}
     local revision, tickRevision = 0, 0
     local function current() return isAlive() and revision == tickRevision end
@@ -43,23 +48,25 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
     local function checkHeals(members, now)
         local allHealed = true
         for _, member in ipairs(members) do
-            local key = tostring(member.id)
-            local cached = healCache[key]
-            if member.present and (not cached or now - cached.at >= 20) then
-                local ok, inv = pcall(Adapter.inventory, member.player)
-                if not active() then return false end
-                cached = { at = now, known = ok, count = ok and #Logic.heals(inv) or 0 }
-                healCache[key] = cached
-                if ok then runtime.Heals[key] = cached.count >= 1 end
+            if member.id ~= carry.id then
+                local key = tostring(member.id)
+                local cached = healCache[key]
+                if member.present and (not cached or now - cached.at >= 20) then
+                    local ok, inv = pcall(Adapter.inventory, member.player)
+                    if not active() then return false end
+                    cached = { at = now, known = ok, count = ok and #Logic.heals(inv) or 0 }
+                    healCache[key] = cached
+                    runtime.Heals[key] = ok and cached.count or nil
+                end
+                if not member.present or not cached or not cached.known or cached.count < 2 then allHealed = false end
             end
-            if not member.present or not cached or not cached.known or cached.count < 1 then allHealed = false end
         end
         return allHealed
     end
     local function needsHeals()
         if not config.ProvisionHeals then return false end
         for _, member in ipairs(roster) do
-            if runtime.Heals[tostring(member.id)] ~= true then return true end
+            if member.id ~= carry.id and (runtime.Heals[tostring(member.id)] or 0) < 2 then return true end
         end
         return false
     end
@@ -130,7 +137,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             inv = Adapter.inventory()
         end
         if controller.SetAbilityInventory then controller.SetAbilityInventory(inv) end
-        runtime.Heals[tostring(player.UserId)] = #Logic.heals(inv) >= 1
+        runtime.Heals[tostring(player.UserId)] = #Logic.heals(inv)
         if current() and config.AutoSell and not Adapter.value(player, "busyTrading", false) then
             local plan, count = Logic.sellPlan(inv, protected, config.KeepItems, config.KeepLegendary)
             if count == 0 then

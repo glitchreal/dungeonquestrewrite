@@ -70,8 +70,9 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
 ## Healer provisioning and selling
 
 Enable **Farm Pirate Island for Universal Heal** on every account to coordinate
-provisioning. The host uses Pirate Island until every selected account, including
-host and carry, owns at least one Universal Heal. Below Pirate Island's level-60
+provisioning. The host uses Pirate Island until the host and every selected alt
+each own at least **two Universal Heals**. The carry is excluded from heal ownership
+checks. Old one-heal readiness flags are discarded and inventories are checked again. Below Pirate Island's level-60
 requirement, it farms eligible content first. It selects the highest eligible
 Pirate difficulty. The party returns to best-dungeon progression after ownership
 is confirmed and non-carry levels match. A failed inventory inspection does not

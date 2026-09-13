@@ -220,7 +220,7 @@ setup:AddLabel("Party list and role settings are shared on this executor workspa
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
-toggle(options, "ProvisionHeals", "Farm Pirate Island for Universal Heal", nil, "Enable on every account. Uses eligible dungeons below level 60; leaves Pirate once every selected account owns a heal and levels match.")
+toggle(options, "ProvisionHeals", "Farm Pirate Island for Universal Heal", nil, "Enable on every account. Uses eligible dungeons below level 60; leaves Pirate once the host and each selected alt own two Universal Heals and their levels match. The carry is excluded from heal requirements.")
 toggle(options, "OCD", "OCD: regroup after disconnects", nil, "Pauses carry farming when anyone is missing. After the grace period, return to lobby and reassemble.")
 slider(options, "RecoveryGrace", "Recovery grace (seconds)", 15, 180)
 slider(options, "StartDelay", "Party-ready delay (seconds)", 0, 30)
