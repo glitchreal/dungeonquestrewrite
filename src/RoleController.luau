@@ -256,7 +256,9 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         controller.SetRunning(state.farming)
         state.status = state.farming and "Carry: pathfinding farm" or config.Role == "Alt" and config.AutoHealer and "Alt: Universal Heal" or "Waiting for carry"
         if config.Role == "Alt" and config.AutoHealer and healer and ready then
-            healer.TryCast(now, 0.35, function(_, snapshot)
+            -- The slot scheduler alternates Q/E and still respects each tool cooldown.
+            -- Stagger heals even when both slots are ready after joining or idling.
+            healer.TryCast(now, 4, function(_, snapshot)
                 if snapshot.name ~= "Universal Heal" then return false end
                 for _, member in ipairs(members) do
                     local character = member.player and member.player.Character

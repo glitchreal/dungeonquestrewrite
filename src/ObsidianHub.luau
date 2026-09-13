@@ -33,6 +33,7 @@ if env.autoloadconfig ~= false then
     end
 end
 if not table.find({ "Carry", "Host", "Alt" }, C.Role) then C.Role = "Carry"; C.Enabled = false end
+C.Alts = table.concat(Logic.tokens(C.Alts), ", ")
 C.RecoveryGrace = math.clamp(C.RecoveryGrace, 15, 180)
 C.JoinInterval = math.clamp(C.JoinInterval, 5, 60)
 C.StartDelay = math.clamp(C.StartDelay, 0, 30)
@@ -113,9 +114,13 @@ local function toggle(group, key, text, callback, tooltip)
     control:OnChanged(function(value) change(key, value, callback) end)
     controls[key] = control
 end
-local function input(group, key, text)
-    local control = group:AddInput(key, { Text = text, Default = C[key], Finished = true, ClearTextOnFocus = false })
-    control:OnChanged(function(value) change(key, value) end)
+local function input(group, key, text, normalize, tooltip)
+    local control = group:AddInput(key, { Text = text, Default = C[key], Finished = true, ClearTextOnFocus = false, Tooltip = tooltip })
+    control:OnChanged(function(value)
+        local formatted = normalize and normalize(value) or value
+        if formatted ~= value then control:SetValue(formatted); return end
+        change(key, formatted)
+    end)
     controls[key] = control
 end
 local function dropdown(group, key, text, values)
@@ -132,7 +137,9 @@ local setup = partyTab:AddLeftGroupbox("Account and party")
 dropdown(setup, "Role", "This account", { "Carry", "Host", "Alt" })
 input(setup, "Host", "Host username or user ID")
 input(setup, "Carry", "Carry username or user ID")
-input(setup, "Alts", "Selected alts (comma-separated)")
+input(setup, "Alts", "Selected alts (paste list, then Enter)", function(value)
+    return table.concat(Logic.tokens(value), ", ")
+end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter to format the list and remove duplicates.")
 setup:AddLabel("Use the same party list on every account. Host and alts level together; carry is excluded from level matching.", true)
 toggle(setup, "Enabled", "Enable role automation")
 local options = partyTab:AddRightGroupbox("Run options")
@@ -161,7 +168,7 @@ toggle(host, "AutoBest", "Create and join best eligible dungeon")
 toggle(host, "AutoAccept", "Accept selected accounts only")
 host:AddLabel("Creates the dungeon, accepts the party, and replays until the host and selected alts match levels. Keep Level Kaitun enabled to start once everyone arrives.", true)
 local alt = roleTab:AddRightGroupbox("3 · Alt")
-toggle(alt, "AutoHealer", "Tank armor + Universal Heal only", nil, "Equips the highest eligible tank helmet/chest and up to two Universal Heals. Casts when a selected party member needs healing.")
+toggle(alt, "AutoHealer", "Tank armor + Universal Heal only", nil, "Equips the highest eligible tank helmet/chest and up to two Universal Heals. Alternates ready heals at least 4 seconds apart when a selected party member needs healing.")
 toggle(alt, "AutoSkillPoints", "Auto allocate skill points")
 dropdown(alt, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
 local inventory = settingsTab:AddLeftGroupbox("All account types")

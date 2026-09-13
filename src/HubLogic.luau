@@ -4,10 +4,11 @@ Logic.Difficulties = { "Easy", "Medium", "Hard", "Insane", "Nightmare" }
 -- These seasonal entries currently lack reliable event flags in getDungeonStats.
 local seasonal = { ["Egg Island"] = true, Krampus = true, ["Tutorial Dungeon"] = true }
 
-function Logic.tokens(csv)
+function Logic.tokens(text)
     local result, seen = {}, {}
-    for token in (csv or ""):gmatch("[^,]+") do
-        token = token:match("^%s*(.-)%s*$")
+    -- Roblox usernames and numeric IDs contain no whitespace. Accept pasted rows,
+    -- tabs, spaces, commas, and semicolons while keeping first-seen spelling.
+    for token in (text or ""):gmatch("[^,%s;]+") do
         if token ~= "" and not seen[token:lower()] then
             seen[token:lower()] = true
             table.insert(result, token)

@@ -12,8 +12,10 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/dungeonque
 ```
 
 Run this on **every account**, initially in a lobby. In **Party**, enter the same
-host username, carry username, and comma-separated selected alt usernames on
-all accounts. User IDs also work; display names do not. Select each account's
+host username, carry username, and selected alt usernames on all accounts.
+Paste the whole alt list using newlines, spaces, tabs, commas, or semicolons, then
+press Enter. The field formats it with commas and removes duplicate entries.
+User IDs also work; display names do not. Select each account's
 role, choose its options, then enable role automation. The host and carry must
 be different accounts. The host and selected alts should begin at the same level;
 the carry can be much higher level.
@@ -67,7 +69,10 @@ establish ownership. New drops are checked again after rewards settle.
 Alt Auto Healer chooses tank/guardian armor by eligible **level first**, then
 health. A tank class/name or health-only armor stats identify tank gear. It equips
 two distinct heals when available; one is usable while waiting for another drop.
-Heal casting uses the game's equipped-slot event and cooldown path.
+Heal casting uses the game's equipped-slot event and cooldown path. The existing
+Auto Healer toggle alternates ready Q/E heals with at least four seconds between
+casts, while still waiting for each skill's real cooldown and a party member to
+need healing. One owned heal also respects its cooldown; no extra toggle is needed.
 
 Auto Sell covers every rarity for weapons, helmets, chests, and abilities. It
 retains up to two Universal Heals, including when only one exists, and preserves
