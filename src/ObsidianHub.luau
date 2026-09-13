@@ -122,6 +122,13 @@ local function input(group, key, text, normalize, tooltip)
         change(key, formatted)
     end)
     controls[key] = control
+    local box = control.Holder and control.Holder:FindFirstChildOfClass("TextBox")
+    if box then
+        -- Obsidian's Finished input only commits on Enter by default.
+        connect(box.FocusLost, function(enterPressed)
+            if not enterPressed then control:SetValue(box.Text) end
+        end)
+    end
 end
 local function dropdown(group, key, text, values)
     local control = group:AddDropdown(key, { Text = text, Values = values, Default = C[key] })
@@ -133,15 +140,21 @@ local function slider(group, key, text, min, max)
     control:OnChanged(function(value) change(key, value) end)
     controls[key] = control
 end
+local automation = partyTab:AddLeftGroupbox("Automation")
+toggle(automation, "Enabled", "Enable role automation", nil, "Starts the selected Carry, Host, or Alt role. Choose Host to create dungeons.")
+automation:AddLabel("Select your account role and fill in the party below. Host creates dungeons; carry and alts request the host.", true)
+local roleAutomation = roleTab:AddLeftGroupbox("Automation")
+roleAutomation:AddButton({ Text = "Start selected role", Func = function() controls.Enabled:SetValue(true) end })
+roleAutomation:AddButton({ Text = "Stop role automation", Func = function() controls.Enabled:SetValue(false) end })
+local roleStatusLabel = roleAutomation:AddLabel("", true)
 local setup = partyTab:AddLeftGroupbox("Account and party")
 dropdown(setup, "Role", "This account", { "Carry", "Host", "Alt" })
 input(setup, "Host", "Host username or user ID")
 input(setup, "Carry", "Carry username or user ID")
-input(setup, "Alts", "Selected alts (paste list, then Enter)", function(value)
+input(setup, "Alts", "Selected alts (paste list)", function(value)
     return table.concat(Logic.tokens(value), ", ")
-end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter to format the list and remove duplicates.")
+end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Use the same party list on every account. Host and alts level together; carry is excluded from level matching.", true)
-toggle(setup, "Enabled", "Enable role automation")
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
@@ -150,7 +163,7 @@ toggle(options, "OCD", "OCD: regroup after disconnects", nil, "Pauses carry farm
 slider(options, "RecoveryGrace", "Recovery grace (seconds)", 15, 180)
 slider(options, "StartDelay", "Party-ready delay (seconds)", 0, 30)
 local status = partyTab:AddRightGroupbox("Live status")
-local statusLabel = status:AddLabel("Disabled", true)
+local statusLabel = status:AddLabel("Off — enable automation at the top of Party", true)
 local partyLabel = status:AddLabel("Configure the selected accounts", true)
 local levelLabel = status:AddLabel("Level: loading", true)
 local errorLabel = status:AddLabel("", true)
@@ -164,7 +177,7 @@ toggle(join, "AutoJoin", "Send join requests to host")
 slider(join, "JoinInterval", "Join request interval (seconds)", 5, 60)
 toggle(join, "AutoSwitch", "Switch when host unlocks better dungeon", nil, "Waits for the run to finish and host/alt levels to match. A host leaving is not an unlock signal.")
 local host = roleTab:AddRightGroupbox("2 · Host")
-toggle(host, "AutoBest", "Create and join best eligible dungeon")
+toggle(host, "AutoBest", "Create and join best eligible dungeon", nil, "Runs when this account is set to Host and role automation is enabled.")
 toggle(host, "AutoAccept", "Accept selected accounts only")
 host:AddLabel("Creates the dungeon, accepts the party, and replays until the host and selected alts match levels. Keep Level Kaitun enabled to start once everyone arrives.", true)
 local alt = roleTab:AddRightGroupbox("3 · Alt")
@@ -248,7 +261,13 @@ task.spawn(function()
         cfg.AUTO_ABILITIES = C.Role == "Carry"
         local ok, err = xpcall(function() coordinator.Tick(os.clock()) end, debug.traceback)
         if not alive then break end
-        if not ok then coordinator.Stop(); errors.Automation = tostring(err) else errors.Automation = nil end
+        if not ok then
+            coordinator.Stop()
+            errors.Automation = tostring(err)
+            local reason = tostring(err):match("^[^\n]+") or "Unknown error"
+            coordinator.status = "Blocked: " .. reason:gsub("^.-:%d+: ", "")
+        else errors.Automation = nil end
+        roleStatusLabel:SetText(C.Role .. " · " .. coordinator.status)
         sellLabel:SetText(coordinator.sellStatus)
         statusLabel:SetText(C.Role .. " · " .. coordinator.status)
         partyLabel:SetText(coordinator.party)

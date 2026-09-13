@@ -14,9 +14,12 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/dungeonque
 Run this on **every account**, initially in a lobby. In **Party**, enter the same
 host username, carry username, and selected alt usernames on all accounts.
 Paste the whole alt list using newlines, spaces, tabs, commas, or semicolons, then
-press Enter. The field formats it with commas and removes duplicate entries.
+press Enter or click away. The field formats it with commas and removes duplicate entries.
 User IDs also work; display names do not. Select each account's
-role, choose its options, then enable role automation. The host and carry must
+role, choose its options, then use **Enable role automation** at the top of Party
+or **Start selected role** at the top of Roles. Dungeon creation requires the
+**Host** role; Carry and Alt send join requests instead. Text fields also save
+when you click away, so Enter is optional. The host and carry must
 be different accounts. The host and selected alts should begin at the same level;
 the carry can be much higher level.
 

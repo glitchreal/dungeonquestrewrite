@@ -196,11 +196,13 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         -- Inventory tools must not depend on a valid party or dungeon catalog.
         inventoryWork(now)
         if not active() then
-            stop(); state.status = "Disabled"; state.missingAt, state.readyAt, state.returning = nil, nil, false
+            stop(); state.status = "Off — enable automation at the top of Party"; state.missingAt, state.readyAt, state.returning = nil, nil, false
             return
         end
+        state.status = "Checking party setup"
         if not configure() then return end
         if mode == "Lobby" and not catalogReady then
+            state.status = "Loading dungeon requirements"
             local catalog = Adapter.catalog()
             if not active() then return end
             runtime.Catalog, catalogReady = catalog, true
@@ -246,9 +248,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
                     if config.Whitelist then
                         for _, account in ipairs(roster) do if account.id ~= host.id then Adapter.call("addPlayerToWhitelist", account.name) end end
                     end
-                    if active() then Adapter.call("startDungeon") end
+                    if active() then
+                        state.status = "Entering " .. chosen.Dungeon .. " / " .. chosen.Difficulty
+                        assert(Adapter.call("startDungeon") ~= false, "Server declined dungeon entry; retrying")
+                    end
                 else
-                    Adapter.createLobby(chosen, config)
+                    state.status = "Creating " .. chosen.Dungeon .. " / " .. chosen.Difficulty
+                    assert(Adapter.createLobby(chosen, config), "Server declined dungeon creation; check your level and lobby state")
+                    state.status = "Lobby created; entering shortly"
                 end
             end
             return
