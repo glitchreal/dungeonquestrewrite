@@ -445,10 +445,133 @@ end
 return Abilities
 
 end)()
+local PartySync = (function()
+-- Optional HTTPS relay. Network I/O runs outside the automation loop; stale
+-- replies never authorize starting or farming, even if a request hangs.
+local PartySync = {}
+function PartySync.new(config, mode, isAlive)
+    local Http = game:GetService("HttpService")
+    local player = game:GetService("Players").LocalPlayer
+    local sync = { status = "Sync off" }
+    local context, response, receivedAt, pending, acknowledged, lastAttempt = nil, nil, nil, nil, false, -math.huge
+    local generation = 0
+    local function signature()
+        return table.concat({ tostring(config.SyncEnabled), config.SyncURL, config.SyncKey,
+            config.Role, config.Host, config.Carry, config.Alts }, "|")
+    end
+    local lastSignature = signature()
+    local function reset()
+        local value = signature()
+        if value ~= lastSignature then
+            lastSignature = value; generation = generation + 1
+            context, response, receivedAt, pending, acknowledged = nil, nil, nil, nil, false
+            lastAttempt = -math.huge
+        end
+    end
+    function sync.Update(roster, host, carry, ready)
+        reset()
+        local ids = {}
+        for _, account in ipairs(roster) do table.insert(ids, account.id) end
+        context = { roster = ids, hostId = host.id, carryId = carry.id, ready = ready, at = os.clock() }
+    end
+    function sync.Pause()
+        if context then context.ready = false end
+    end
+    function sync.Regroup(reason)
+        reset()
+        if not config.SyncEnabled or config.Role ~= "Host" then return true end
+        if not pending then pending = reason; acknowledged = false end
+        return acknowledged
+    end
+    function sync.Command()
+        reset()
+        if config.SyncEnabled and response and receivedAt and os.clock() - receivedAt <= 20 then
+            local command = response.command
+            if type(command) == "table" and command.jobId == game.JobId and type(command.reason) == "string" then
+                return command.reason
+            end
+        end
+    end
+    function sync.Ready(roster)
+        reset()
+        if not config.SyncEnabled then sync.status = "Sync off"; return true end
+        local now = os.clock()
+        if not response or not receivedAt or now - receivedAt > 20 then
+            if response then sync.status = "Sync stale; waiting to reconnect" end
+            return false
+        end
+        local observed = {}
+        for _, member in ipairs(response.members) do observed[member.userId] = member end
+        local missing = {}
+        for _, account in ipairs(roster) do
+            local member = observed[account.id]
+            if not member or member.mode ~= mode or member.jobId ~= game.JobId or member.placeId ~= game.PlaceId
+                or member.enabled ~= true or member.ready ~= true or type(member.age) ~= "number"
+                or member.age + now - receivedAt > 35 then table.insert(missing, account.name) end
+        end
+        sync.status = #missing == 0 and "Sync: all scripts ready" or ("Sync waiting: " .. table.concat(missing, ", "))
+        return #missing == 0
+    end
+    task.spawn(function()
+        while isAlive() do
+            reset()
+            local now = os.clock()
+            if not config.SyncEnabled then sync.status = "Sync off"
+            elseif context and now - lastAttempt >= 10 then
+                lastAttempt = now
+                local request = request or http_request or (syn and syn.request)
+                local url = config.SyncURL:gsub("/+$", "")
+                if not url:match("^https://[^/]+$") or #config.SyncKey < 32 then
+                    response, receivedAt = nil, nil
+                    sync.status = "Sync: enter HTTPS relay URL and key (32+ characters)"
+                elseif type(request) ~= "function" then
+                    response, receivedAt = nil, nil
+                    sync.status = "Sync: executor HTTP requests unavailable"
+                else
+                    local sentGeneration = generation
+                    local sentSignature = lastSignature
+                    local sentAt = os.clock()
+                    local payload = {
+                        roster = context.roster, hostId = context.hostId, carryId = context.carryId,
+                        userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
+                        enabled = config.Enabled, ready = config.Enabled and context.ready and not pending and now - context.at < 5,
+                        regroup = pending,
+                    }
+                    local ok, result = pcall(function()
+                        local reply = request({ Url = url .. "/sync", Method = "POST", Timeout = 8,
+                            Headers = { ["Content-Type"] = "application/json", Authorization = "Bearer " .. config.SyncKey },
+                            Body = Http:JSONEncode(payload) })
+                        assert(reply and reply.StatusCode == 200, "Relay HTTP " .. tostring(reply and reply.StatusCode))
+                        local decoded = Http:JSONDecode(reply.Body)
+                        assert(decoded.protocol == 1 and type(decoded.members) == "table", "Invalid relay response")
+                        return decoded
+                    end)
+                    if not isAlive() then return end
+                    reset()
+                    if generation == sentGeneration and signature() == sentSignature then
+                        if ok and os.clock() - sentAt <= 8 then
+                            response, receivedAt = result, sentAt
+                            if pending and type(result.command) == "table" and result.command.jobId == game.JobId then acknowledged = true end
+                            sync.status = "Sync connected"
+                        else
+                            response, receivedAt = nil, nil
+                            sync.status = "Sync unavailable; waiting to reconnect"
+                        end
+                    end
+                end
+            elseif not context then sync.status = "Sync: waiting for valid party setup" end
+            task.wait(0.5)
+        end
+    end)
+    return sync
+end
+return PartySync
+
+end)()
 local Roles = (function()
 -- One coordinator owns queueing, progression, recovery, and inventory mutations.
 local Roles = {}
-function Roles.new(config, runtime, mode, controller, save, isAlive)
+function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local player = game:GetService("Players").LocalPlayer
     local Players = game:GetService("Players")
     local state = { sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
@@ -479,6 +602,10 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
     local function returnLobby(reason, now)
         stop()
         state.returning, state.status = true, reason
+        if sync and not sync.Regroup(reason) then
+            state.status = "Waiting for relay to announce regroup"
+            return
+        end
         if due("return", 15, now) and active() then save(); Adapter.call("teleToLobby") end
     end
     local function configure()
@@ -649,7 +776,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         state.status = "Teleport failed; retrying"
         times["return"], times["queue"], times["replay"] = nil, nil, nil
     end
-    function state.Stop() revision = revision + 1; stop() end
+    function state.Stop() revision = revision + 1; stop(); if sync then sync.Pause() end end
     function state.Tick(now)
         tickRevision = revision
         if not isAlive() then return end
@@ -666,6 +793,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         end
         state.status = "Checking party setup"
         if not configure() then return end
+        if sync then sync.Update(roster, host, carry, true) end
         if mode == "Lobby" and not catalogReady then
             state.status = "Loading dungeon requirements"
             local catalog = Adapter.catalog()
@@ -727,13 +855,20 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         end
         -- Owner metadata is not reliable on first entry or after ownership transfers.
         -- Role selection controls requests; the server validates owner-only actions.
+        if sync and config.Role ~= "Host" then
+            local regroup = sync.Command()
+            if regroup then returnLobby("Host regroup: " .. regroup, now); return end
+        end
         processRequests(now)
         if not active() then return end
         local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
         state.party = ready and (equal and "Party present; host and alts at the same level" or "Party present; waiting for levels to match")
             or ("Missing: " .. table.concat(missing, ", "))
-        if ready then state.partySeen = true; state.missingAt = nil; state.readyAt = state.readyAt or now
-        else state.readyAt = nil; state.missingAt = state.missingAt or now end
+        if ready then state.partySeen = true; state.missingAt = nil
+        else state.missingAt = state.missingAt or now end
+        local scriptsReady = not sync or sync.Ready(roster)
+        local canRun = ready and scriptsReady
+        if canRun then state.readyAt = state.readyAt or now else state.readyAt = nil end
         if state.returning then returnLobby(state.status, now); return end
         local started = Adapter.PlaceManager.HasDungeonStarted()
         -- Initial assembly has no timeout. Recover only a party that was assembled
@@ -753,7 +888,8 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         for _, member in ipairs(members) do if member.id == host.id then hostLevel = member.level end end
         local chosen = hostLevel and selection(hostLevel)
         local current = Adapter.currentDungeon()
-        local switchEnabled = config.Role == "Host" and config.AutoBest or config.Role ~= "Host" and config.AutoSwitch
+        local switchEnabled = config.Role == "Host" and config.AutoBest
+            or config.Role ~= "Host" and config.AutoSwitch and not config.SyncEnabled
         local switch = switchEnabled and ready and equal and chosen and not Logic.sameDungeon(chosen, current)
         if state.finished then
             stop()
@@ -762,7 +898,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             if now - state.finishedAt < 5 then state.status = "Waiting for rewards"; return end
             if switch then returnLobby("Progression: " .. chosen.Dungeon .. " / " .. chosen.Difficulty, now); return end
             state.status = ready and "Run ended; replaying current dungeon" or "Run ended; waiting for party"
-            if config.Role == "Host" and ready and due("replay", 15, now) and active() then Adapter.replay() end
+            if config.Role == "Host" and canRun and due("replay", 15, now) and active() then Adapter.replay() end
             return
         end
         if not started then
@@ -770,18 +906,18 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             if switch and current.Dungeon == "Pirate Island" and allHealed then
                 returnLobby("Universal Heal ready; selecting best dungeon", now); return
             end
-            state.status = ready and "Party ready; waiting to start" or "Waiting for selected accounts"
+            state.status = canRun and "Party ready; waiting to start" or ready and "Waiting for selected scripts through relay" or "Waiting for selected accounts"
             -- Carry owns Level Kaitun policy; the host mirrors its readiness gate for owner-only servers.
-            if ready and now - state.readyAt >= config.StartDelay and config.LevelKaitun
+            if canRun and now - state.readyAt >= config.StartDelay and config.LevelKaitun
                 and (config.Role == "Carry" or config.Role == "Host") and due("start", 5, now) and active() then
                 Adapter.call("changeStartValue")
             end
             return
         end
-        state.farming = config.Role == "Carry" and config.LevelKaitun and ready
+        state.farming = config.Role == "Carry" and config.LevelKaitun and canRun
         controller.SetRunning(state.farming)
         state.status = state.farming and "Carry: pathfinding farm" or config.Role == "Alt" and config.AutoHealer and "Alt: Universal Heal" or "Waiting for carry"
-        if config.Role == "Alt" and config.AutoHealer and healer and ready then
+        if config.Role == "Alt" and config.AutoHealer and healer and canRun then
             -- The slot scheduler alternates Q/E and still respects each tool cooldown.
             -- Stagger heals even when both slots are ready after joining or idling.
             healer.TryCast(now, 4, function(_, snapshot)
@@ -3459,6 +3595,7 @@ local C = {
     AutoJoin = true, AutoAccept = true, Hardcore = false, Whitelist = true,
     LevelKaitun = true, AutoBest = true, AutoSwitch = true, ProvisionHeals = true,
     AutoHealer = false, AutoSell = false, KeepItems = "", KeepLegendary = true, AutoSkillPoints = false, UpgradeStat = "Stamina",
+    SyncEnabled = false, SyncURL = "", SyncKey = "",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
     Distance = 20, SpellRange = 26, AutoDodge = true,
@@ -3471,9 +3608,10 @@ local function readShared(path)
     local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
     if ok and type(data) == "table" and data.Version == 1 then return data end
 end
+local accountOnly = { SyncEnabled = true, SyncURL = true, SyncKey = true }
 local function applyValues(values)
     for key, value in pairs(type(values) == "table" and values or {}) do
-        if defaults[key] ~= nil and type(value) == type(defaults[key]) then C[key] = value end
+        if not accountOnly[key] and defaults[key] ~= nil and type(value) == type(defaults[key]) then C[key] = value end
     end
 end
 local runtime, menuKey = {}, "RightShift"
@@ -3510,6 +3648,12 @@ if env.autoloadconfig ~= false and type(resume) ~= "table" then
         if type(party[key]) == "string" then C[key] = party[key] end
     end
 end
+-- A private setup loader can configure the relay without publishing credentials.
+local syncSetup = env.DQRewriteSync
+if type(syncSetup) == "table" and type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string" then
+    C.SyncURL, C.SyncKey, C.SyncEnabled = syncSetup.URL, syncSetup.Key, true
+    env.DQRewriteSync = nil
+end
 if not table.find({ "Carry", "Host", "Alt" }, C.Role) then C.Role = "Carry"; C.Enabled = false end
 C.Alts = table.concat(Logic.tokens(C.Alts), ", ")
 C.RecoveryGrace = math.clamp(C.RecoveryGrace, 15, 180)
@@ -3523,7 +3667,7 @@ Library.ScreenGui.ResetOnSpawn = false
 Library.Scheme.AccentColor = Color3.fromRGB(63, 205, 134)
 local controller = createController()
 local alive, hooks, controls, errors = true, {}, {}, {}
-local coordinator
+local coordinator, partySync
 local editingParty = false
 local partyInputs = {}
 local previousFPS = type(getfpscap) == "function" and getfpscap() or nil
@@ -3551,7 +3695,9 @@ local function publishProfile(partyKey)
     local ok = pcall(function()
         -- Separate role files avoid carry/host/alt saves replacing each other's profiles.
         if Logic.accountRole(C, player.Name, player.UserId) == C.Role then
-            writefile(profilePath(C.Role), HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey }))
+            local profile = table.clone(C)
+            for key in pairs(accountOnly) do profile[key] = nil end
+            writefile(profilePath(C.Role), HttpService:JSONEncode({ Version = 1, Config = profile, MenuKey = menuKey }))
         end
         local shared = readShared(partyPath)
         local party = shared and type(shared.Party) == "table" and shared.Party or { Host = C.Host, Carry = C.Carry, Alts = C.Alts }
@@ -3664,6 +3810,12 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
     return table.concat(Logic.tokens(value), ", ")
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
+local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
+toggle(syncGroup, "SyncEnabled", "Require scripts ready through relay", nil, "Enable on every selected account. Waits for fresh script heartbeats in the same dungeon and follows host regroup messages.")
+input(syncGroup, "SyncURL", "Relay HTTPS URL")
+input(syncGroup, "SyncKey", "Private relay key")
+syncGroup:AddLabel("Use the same relay URL and key on every account. This does not execute scripts on other accounts.", true)
+local syncLabel = syncGroup:AddLabel("Sync off", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
@@ -3734,9 +3886,10 @@ menu:AddButton({ Text = "Return to lobby", Func = function()
     if MODE == "Dungeon" then coordinator.Stop(); save(); Adapter.call("teleToLobby") end
 end })
 menu:AddButton({ Text = "Unload", Func = unload })
-coordinator = Roles.new(C, runtime, MODE, controller, save, function() return alive end)
+partySync = PartySync.new(C, MODE, function() return alive end)
+coordinator = Roles.new(C, runtime, MODE, controller, save, function() return alive end, partySync)
 env.DungeonQuestObsidian = { Config = C, Runtime = runtime, Controller = controller, Coordinator = coordinator,
-    Library = Library, Unload = unload, Errors = errors, Mode = MODE }
+    Library = Library, Sync = partySync, Unload = unload, Errors = errors, Mode = MODE }
 local teleportQueued = false
 connect(player.OnTeleport, function(state)
     if state == Enum.TeleportState.Failed then teleportQueued = false; coordinator.TeleportFailed(); return end
@@ -3784,6 +3937,7 @@ task.spawn(function()
             coordinator.status = "Blocked: " .. reason:gsub("^.-:%d+: ", "")
         else errors.Automation = nil end
         saveLabel:SetText(errors.Save or errors.Profile or ("Profile: " .. C.Role .. " | Account: " .. player.Name))
+        syncLabel:SetText(partySync.status)
         roleStatusLabel:SetText(C.Role .. " · " .. coordinator.status)
         sellLabel:SetText(coordinator.sellStatus)
         statusLabel:SetText(C.Role .. " · " .. coordinator.status)

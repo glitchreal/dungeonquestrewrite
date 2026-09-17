@@ -1,6 +1,6 @@
 -- One coordinator owns queueing, progression, recovery, and inventory mutations.
 local Roles = {}
-function Roles.new(config, runtime, mode, controller, save, isAlive)
+function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local player = game:GetService("Players").LocalPlayer
     local Players = game:GetService("Players")
     local state = { sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
@@ -31,6 +31,10 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
     local function returnLobby(reason, now)
         stop()
         state.returning, state.status = true, reason
+        if sync and not sync.Regroup(reason) then
+            state.status = "Waiting for relay to announce regroup"
+            return
+        end
         if due("return", 15, now) and active() then save(); Adapter.call("teleToLobby") end
     end
     local function configure()
@@ -201,7 +205,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         state.status = "Teleport failed; retrying"
         times["return"], times["queue"], times["replay"] = nil, nil, nil
     end
-    function state.Stop() revision = revision + 1; stop() end
+    function state.Stop() revision = revision + 1; stop(); if sync then sync.Pause() end end
     function state.Tick(now)
         tickRevision = revision
         if not isAlive() then return end
@@ -218,6 +222,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         end
         state.status = "Checking party setup"
         if not configure() then return end
+        if sync then sync.Update(roster, host, carry, true) end
         if mode == "Lobby" and not catalogReady then
             state.status = "Loading dungeon requirements"
             local catalog = Adapter.catalog()
@@ -279,13 +284,20 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         end
         -- Owner metadata is not reliable on first entry or after ownership transfers.
         -- Role selection controls requests; the server validates owner-only actions.
+        if sync and config.Role ~= "Host" then
+            local regroup = sync.Command()
+            if regroup then returnLobby("Host regroup: " .. regroup, now); return end
+        end
         processRequests(now)
         if not active() then return end
         local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
         state.party = ready and (equal and "Party present; host and alts at the same level" or "Party present; waiting for levels to match")
             or ("Missing: " .. table.concat(missing, ", "))
-        if ready then state.partySeen = true; state.missingAt = nil; state.readyAt = state.readyAt or now
-        else state.readyAt = nil; state.missingAt = state.missingAt or now end
+        if ready then state.partySeen = true; state.missingAt = nil
+        else state.missingAt = state.missingAt or now end
+        local scriptsReady = not sync or sync.Ready(roster)
+        local canRun = ready and scriptsReady
+        if canRun then state.readyAt = state.readyAt or now else state.readyAt = nil end
         if state.returning then returnLobby(state.status, now); return end
         local started = Adapter.PlaceManager.HasDungeonStarted()
         -- Initial assembly has no timeout. Recover only a party that was assembled
@@ -305,7 +317,8 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         for _, member in ipairs(members) do if member.id == host.id then hostLevel = member.level end end
         local chosen = hostLevel and selection(hostLevel)
         local current = Adapter.currentDungeon()
-        local switchEnabled = config.Role == "Host" and config.AutoBest or config.Role ~= "Host" and config.AutoSwitch
+        local switchEnabled = config.Role == "Host" and config.AutoBest
+            or config.Role ~= "Host" and config.AutoSwitch and not config.SyncEnabled
         local switch = switchEnabled and ready and equal and chosen and not Logic.sameDungeon(chosen, current)
         if state.finished then
             stop()
@@ -314,7 +327,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             if now - state.finishedAt < 5 then state.status = "Waiting for rewards"; return end
             if switch then returnLobby("Progression: " .. chosen.Dungeon .. " / " .. chosen.Difficulty, now); return end
             state.status = ready and "Run ended; replaying current dungeon" or "Run ended; waiting for party"
-            if config.Role == "Host" and ready and due("replay", 15, now) and active() then Adapter.replay() end
+            if config.Role == "Host" and canRun and due("replay", 15, now) and active() then Adapter.replay() end
             return
         end
         if not started then
@@ -322,18 +335,18 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             if switch and current.Dungeon == "Pirate Island" and allHealed then
                 returnLobby("Universal Heal ready; selecting best dungeon", now); return
             end
-            state.status = ready and "Party ready; waiting to start" or "Waiting for selected accounts"
+            state.status = canRun and "Party ready; waiting to start" or ready and "Waiting for selected scripts through relay" or "Waiting for selected accounts"
             -- Carry owns Level Kaitun policy; the host mirrors its readiness gate for owner-only servers.
-            if ready and now - state.readyAt >= config.StartDelay and config.LevelKaitun
+            if canRun and now - state.readyAt >= config.StartDelay and config.LevelKaitun
                 and (config.Role == "Carry" or config.Role == "Host") and due("start", 5, now) and active() then
                 Adapter.call("changeStartValue")
             end
             return
         end
-        state.farming = config.Role == "Carry" and config.LevelKaitun and ready
+        state.farming = config.Role == "Carry" and config.LevelKaitun and canRun
         controller.SetRunning(state.farming)
         state.status = state.farming and "Carry: pathfinding farm" or config.Role == "Alt" and config.AutoHealer and "Alt: Universal Heal" or "Waiting for carry"
-        if config.Role == "Alt" and config.AutoHealer and healer and ready then
+        if config.Role == "Alt" and config.AutoHealer and healer and canRun then
             -- The slot scheduler alternates Q/E and still respects each tool cooldown.
             -- Stagger heals even when both slots are ready after joining or idling.
             healer.TryCast(now, 4, function(_, snapshot)

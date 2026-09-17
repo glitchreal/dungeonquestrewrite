@@ -21,6 +21,7 @@ for _, route in ipairs({ "lobby", "dungeon" }) do
         module("Logic", "src/HubLogic.luau"),
         module("Adapter", "src/GameAdapter.luau"),
         module("AbilityController", "src/AbilityController.luau"),
+        module("PartySync", "src/PartySync.luau"),
         module("Roles", "src/RoleController.luau"),
     }
     if route == "dungeon" then

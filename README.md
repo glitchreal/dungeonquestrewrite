@@ -50,22 +50,57 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
   The host scans existing request prompts once per second as well as listening for
   new requests, so requests received before the script loaded are recovered.
   Unresolved prompts are retried at most once every five seconds.
-- Before starting, every selected account must be in the same dungeon and have a
-  readable level. The configurable party-ready delay gives arrivals time to settle.
+- Before starting, every selected account must be present in the same dungeon.
+  Readable matching non-carry levels are required for progression, not starting. The configurable party-ready delay gives arrivals time to settle.
 - At the end of a run, switching waits five seconds for rewards, verifies the host's
   current level, and requires every selected non-carry account to match it. The host
   returns to create the new dungeon; carry/alt accounts return and request the host
   again. Enable Auto Best on the host and Auto Switch on the carry/alts.
-- Ownership checks use the server-replicated active owner first, then the game
-  owner API and teleport data. Missing owner data means wait, not a wrong-host error.
+- Starting and recovery do not depend on dungeon-owner metadata. Host role
+  controls join-request handling; the game enforces owner-only actions.
 - A host disappearing is **not** treated as a level unlock. With OCD disabled, the
-  carry pauses and waits. With OCD enabled on every account, a missing/loading party
-  member for the grace period sends the remaining accounts back to the lobby to
-  regroup. Requests and teleports are retried at bounded intervals.
+  carry pauses and waits. Initial party assembly has no timeout. With OCD enabled
+  on every account, a player missing from a previously assembled party (or an
+  already-started run) for the grace period triggers lobby recovery. Requests and teleports are retried at bounded intervals.
 - Recovery remembers observed alt levels and caps the host's new selection at the
   lowest known non-carry level so a disconnected alt is not locked out. The party
   replays while levels differ. It cannot undo XP earned before a disconnect or
   guarantee identical XP/levels when account XP boosts differ.
+
+## Optional cross-client sync
+
+A small HTTPS relay lets separate devices report that their **scripts** are running,
+not just that their players are present. In Party → Cross-client sync, enter the same
+relay URL and private key on every selected account and enable the toggle on each.
+An optional private setup loader can set `getgenv().DQRewriteSync = { URL = "https://YOUR-RELAY.workers.dev", Key = "YOUR-PRIVATE-KEY" }`
+before running the regular main loader. These values save per account and continue
+through teleports. Never commit or publicly share the real key or setup loader.
+
+- Every account sends a heartbeat every 10 seconds. Starting, replaying, farming,
+  and automatic healing require fresh enabled/ready reports from the entire party
+  in the **same dungeon job**. The start delay resets when readiness is lost.
+- If the relay stops responding, clients pause these actions instead of assuming
+  other scripts are ready. The UI lists missing, paused, or different-server accounts.
+- The host publishes a regroup message before its automated lobby return and waits
+  for relay acknowledgment. Carry and alts in the old job follow that message, even
+  if their own catalog is missing or they missed the host leaving. Level eligibility
+  and reward checks still govern host progression. With sync enabled, followers use
+  the host's progression decision instead of independently switching dungeons.
+- Regroup messages expire after three minutes and target only the old job. Ordinary
+  missing-player OCD recovery still works independently on carry/alt clients.
+- Disabling sync restores the presence-only behavior. The manual Return to lobby
+  button remains an individual action. Sync cannot inject or execute a script on
+  another account: run the loader on each account and keep teleport execution enabled.
+- Executors need an HTTPS `request`, `http_request`, or `syn.request` API. Settings
+  files and the private key remain local; the relay only receives party IDs, server
+  IDs, place, enabled/readiness flags, and regroup reasons. Party members sharing a
+  key are trusted: this is a private coordination service, not Roblox identity proof.
+
+The deployable Cloudflare Worker is in [`src/relay`](src/relay/README.md). It uses a
+SQLite-backed Durable Object supported by the Workers Free plan. Ten continuously
+running accounts at the default interval use about 86,400 requests/day, before
+restarts and other traffic; the Free plan allowance is 100,000/day. Stay on Free:
+exceeding its quota stops requests rather than automatically buying extra capacity.
 
 ## Healer provisioning and selling
 
@@ -122,7 +157,8 @@ Files in the executor workspace:
 - `DungeonQuestRewrite-<userId>.json`: account fallback and runtime observations.
 
 Role profiles publish on user edits. Periodic saves and teleports update only the
-account file, so idle accounts do not overwrite shared settings. An existing
+account file, so idle accounts do not overwrite shared settings. An in-memory
+teleport snapshot takes precedence over shared profiles on arrival. An existing
 account config seeds a missing role profile when its party identifies that account.
 Party text saves while typing and is captured again before unload/teleport.
 Role automation pauses during party edits to avoid using unfinished usernames.

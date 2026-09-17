@@ -13,6 +13,7 @@ local C = {
     AutoJoin = true, AutoAccept = true, Hardcore = false, Whitelist = true,
     LevelKaitun = true, AutoBest = true, AutoSwitch = true, ProvisionHeals = true,
     AutoHealer = false, AutoSell = false, KeepItems = "", KeepLegendary = true, AutoSkillPoints = false, UpgradeStat = "Stamina",
+    SyncEnabled = false, SyncURL = "", SyncKey = "",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
     Distance = 20, SpellRange = 26, AutoDodge = true,
@@ -25,9 +26,10 @@ local function readShared(path)
     local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
     if ok and type(data) == "table" and data.Version == 1 then return data end
 end
+local accountOnly = { SyncEnabled = true, SyncURL = true, SyncKey = true }
 local function applyValues(values)
     for key, value in pairs(type(values) == "table" and values or {}) do
-        if defaults[key] ~= nil and type(value) == type(defaults[key]) then C[key] = value end
+        if not accountOnly[key] and defaults[key] ~= nil and type(value) == type(defaults[key]) then C[key] = value end
     end
 end
 local runtime, menuKey = {}, "RightShift"
@@ -64,6 +66,12 @@ if env.autoloadconfig ~= false and type(resume) ~= "table" then
         if type(party[key]) == "string" then C[key] = party[key] end
     end
 end
+-- A private setup loader can configure the relay without publishing credentials.
+local syncSetup = env.DQRewriteSync
+if type(syncSetup) == "table" and type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string" then
+    C.SyncURL, C.SyncKey, C.SyncEnabled = syncSetup.URL, syncSetup.Key, true
+    env.DQRewriteSync = nil
+end
 if not table.find({ "Carry", "Host", "Alt" }, C.Role) then C.Role = "Carry"; C.Enabled = false end
 C.Alts = table.concat(Logic.tokens(C.Alts), ", ")
 C.RecoveryGrace = math.clamp(C.RecoveryGrace, 15, 180)
@@ -77,7 +85,7 @@ Library.ScreenGui.ResetOnSpawn = false
 Library.Scheme.AccentColor = Color3.fromRGB(63, 205, 134)
 local controller = createController()
 local alive, hooks, controls, errors = true, {}, {}, {}
-local coordinator
+local coordinator, partySync
 local editingParty = false
 local partyInputs = {}
 local previousFPS = type(getfpscap) == "function" and getfpscap() or nil
@@ -105,7 +113,9 @@ local function publishProfile(partyKey)
     local ok = pcall(function()
         -- Separate role files avoid carry/host/alt saves replacing each other's profiles.
         if Logic.accountRole(C, player.Name, player.UserId) == C.Role then
-            writefile(profilePath(C.Role), HttpService:JSONEncode({ Version = 1, Config = C, MenuKey = menuKey }))
+            local profile = table.clone(C)
+            for key in pairs(accountOnly) do profile[key] = nil end
+            writefile(profilePath(C.Role), HttpService:JSONEncode({ Version = 1, Config = profile, MenuKey = menuKey }))
         end
         local shared = readShared(partyPath)
         local party = shared and type(shared.Party) == "table" and shared.Party or { Host = C.Host, Carry = C.Carry, Alts = C.Alts }
@@ -218,6 +228,12 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
     return table.concat(Logic.tokens(value), ", ")
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
+local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
+toggle(syncGroup, "SyncEnabled", "Require scripts ready through relay", nil, "Enable on every selected account. Waits for fresh script heartbeats in the same dungeon and follows host regroup messages.")
+input(syncGroup, "SyncURL", "Relay HTTPS URL")
+input(syncGroup, "SyncKey", "Private relay key")
+syncGroup:AddLabel("Use the same relay URL and key on every account. This does not execute scripts on other accounts.", true)
+local syncLabel = syncGroup:AddLabel("Sync off", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
@@ -288,9 +304,10 @@ menu:AddButton({ Text = "Return to lobby", Func = function()
     if MODE == "Dungeon" then coordinator.Stop(); save(); Adapter.call("teleToLobby") end
 end })
 menu:AddButton({ Text = "Unload", Func = unload })
-coordinator = Roles.new(C, runtime, MODE, controller, save, function() return alive end)
+partySync = PartySync.new(C, MODE, function() return alive end)
+coordinator = Roles.new(C, runtime, MODE, controller, save, function() return alive end, partySync)
 env.DungeonQuestObsidian = { Config = C, Runtime = runtime, Controller = controller, Coordinator = coordinator,
-    Library = Library, Unload = unload, Errors = errors, Mode = MODE }
+    Library = Library, Sync = partySync, Unload = unload, Errors = errors, Mode = MODE }
 local teleportQueued = false
 connect(player.OnTeleport, function(state)
     if state == Enum.TeleportState.Failed then teleportQueued = false; coordinator.TeleportFailed(); return end
@@ -338,6 +355,7 @@ task.spawn(function()
             coordinator.status = "Blocked: " .. reason:gsub("^.-:%d+: ", "")
         else errors.Automation = nil end
         saveLabel:SetText(errors.Save or errors.Profile or ("Profile: " .. C.Role .. " | Account: " .. player.Name))
+        syncLabel:SetText(partySync.status)
         roleStatusLabel:SetText(C.Role .. " · " .. coordinator.status)
         sellLabel:SetText(coordinator.sellStatus)
         statusLabel:SetText(C.Role .. " · " .. coordinator.status)
