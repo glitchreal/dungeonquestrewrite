@@ -152,11 +152,12 @@ function Logic.partyReady(members, hostId, carryId)
     local hostLevel, missing, equal = nil, {}, true
     for _, member in ipairs(members) do
         if member.id == hostId and member.present then hostLevel = member.level end
-        if not member.present or not member.level then table.insert(missing, member.name) end
+        if not member.present then table.insert(missing, member.name) end
     end
-    if not hostLevel or #missing > 0 then return false, false, missing end
+    if #missing > 0 then return false, false, missing end
+    if not hostLevel then equal = false end
     for _, member in ipairs(members) do
-        if member.id ~= carryId and member.level ~= hostLevel then equal = false end
+        if member.id ~= carryId and (not member.level or member.level ~= hostLevel) then equal = false end
     end
     return true, equal, missing
 end
@@ -486,7 +487,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             local newRoster, newHost, newCarry = Adapter.roster(config)
             if not active() then return false end
             roster, host, carry, rosterKey = newRoster, newHost, newCarry, key
-            state.missingAt, state.readyAt, state.returning = nil, nil, false
+            state.missingAt, state.readyAt, state.returning, state.partySeen = nil, nil, false, false
             healCache = {}
             state.party = "Host: " .. host.name .. " | Carry: " .. carry.name .. " | " .. (#roster - 2) .. " selected alts"
         end
@@ -624,7 +625,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
                 for _, account in ipairs(roster) do
                     if request.name:lower() == account.name:lower() and account.id ~= host.id then allowed = true; break end
                 end
-                if active() and Adapter.ownerId() == host.id then
+                if active() then
                     Adapter.call("respondJoinRequest", id, allowed)
                     state.responded[id] = now
                     state.requests[id] = nil
@@ -660,7 +661,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         -- Inventory tools must not depend on a valid party or dungeon catalog.
         inventoryWork(now)
         if not active() then
-            stop(); state.status = "Off — enable automation at the top of Party"; state.missingAt, state.readyAt, state.returning = nil, nil, false
+            stop(); state.status = "Off — enable automation at the top of Party"; state.missingAt, state.readyAt, state.returning, state.partySeen = nil, nil, false, false
             return
         end
         state.status = "Checking party setup"
@@ -724,24 +725,22 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             end
             return
         end
-        local ownerId = Adapter.ownerId()
-        if not ownerId then
-            stop(); state.status = "Waiting for dungeon owner data"; return
-        end
-        assert(ownerId == host.id, "Dungeon owner ID " .. ownerId .. " does not match selected host " .. host.name .. " (" .. host.id .. ")")
+        -- Owner metadata is not reliable on first entry or after ownership transfers.
+        -- Role selection controls requests; the server validates owner-only actions.
         processRequests(now)
-        assert(next(runtime.Catalog), "Dungeon catalog unavailable; return to lobby once with automation enabled")
         if not active() then return end
         local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
         state.party = ready and (equal and "Party present; host and alts at the same level" or "Party present; waiting for levels to match")
-            or ("Missing / loading: " .. table.concat(missing, ", "))
-        if ready then state.missingAt = nil; state.readyAt = state.readyAt or now
+            or ("Missing: " .. table.concat(missing, ", "))
+        if ready then state.partySeen = true; state.missingAt = nil; state.readyAt = state.readyAt or now
         else state.readyAt = nil; state.missingAt = state.missingAt or now end
         if state.returning then returnLobby(state.status, now); return end
-        if config.OCD and not ready and now - state.missingAt >= config.RecoveryGrace then
+        local started = Adapter.PlaceManager.HasDungeonStarted()
+        -- Initial assembly has no timeout. Recover only a party that was assembled
+        -- or a run already in progress, so slow joins do not eject the host.
+        if config.OCD and (state.partySeen or started) and not ready and now - state.missingAt >= config.RecoveryGrace then
             returnLobby("OCD recovery: regrouping in lobby", now); return
         end
-        local started = Adapter.PlaceManager.HasDungeonStarted()
         if Adapter.failed() then state.Finish(true)
         elseif Adapter.finished() then state.Finish() end
         if state.finishedAt and now - state.finishedAt >= 5 and not state.rewardsRefreshed then
@@ -855,7 +854,8 @@ if env.autoloadconfig ~= false then
         if type(saved.MenuKey) == "string" then menuKey = saved.MenuKey end
     end
 end
-if env.autoloadconfig ~= false then
+-- A teleport snapshot belongs to this account and takes precedence over shared profiles.
+if env.autoloadconfig ~= false and type(resume) ~= "table" then
     local shared = readShared(partyPath)
     local party = shared and type(shared.Party) == "table" and shared.Party or table.clone(C)
     local detected = Logic.accountRole(party, player.Name, player.UserId)
@@ -1031,7 +1031,7 @@ local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
 toggle(options, "ProvisionHeals", "Farm Pirate Island for Universal Heal", nil, "Enable on every account. Uses eligible dungeons below level 60; leaves Pirate once the host and each selected alt own two Universal Heals and their levels match. The carry is excluded from heal requirements.")
-toggle(options, "OCD", "OCD: regroup after disconnects", nil, "Pauses carry farming when anyone is missing. After the grace period, return to lobby and reassemble.")
+toggle(options, "OCD", "OCD: regroup after disconnects", nil, "Pauses carry farming when anyone is missing. Waits indefinitely for initial arrivals; after an assembled party loses someone, returns to lobby after the grace period.")
 slider(options, "RecoveryGrace", "Recovery grace (seconds)", 15, 180)
 slider(options, "StartDelay", "Party-ready delay (seconds)", 0, 30)
 local status = partyTab:AddRightGroupbox("Live status")

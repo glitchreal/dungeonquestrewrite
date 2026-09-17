@@ -145,11 +145,12 @@ function Logic.partyReady(members, hostId, carryId)
     local hostLevel, missing, equal = nil, {}, true
     for _, member in ipairs(members) do
         if member.id == hostId and member.present then hostLevel = member.level end
-        if not member.present or not member.level then table.insert(missing, member.name) end
+        if not member.present then table.insert(missing, member.name) end
     end
-    if not hostLevel or #missing > 0 then return false, false, missing end
+    if #missing > 0 then return false, false, missing end
+    if not hostLevel then equal = false end
     for _, member in ipairs(members) do
-        if member.id ~= carryId and member.level ~= hostLevel then equal = false end
+        if member.id ~= carryId and (not member.level or member.level ~= hostLevel) then equal = false end
     end
     return true, equal, missing
 end

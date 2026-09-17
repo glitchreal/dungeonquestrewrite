@@ -39,7 +39,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             local newRoster, newHost, newCarry = Adapter.roster(config)
             if not active() then return false end
             roster, host, carry, rosterKey = newRoster, newHost, newCarry, key
-            state.missingAt, state.readyAt, state.returning = nil, nil, false
+            state.missingAt, state.readyAt, state.returning, state.partySeen = nil, nil, false, false
             healCache = {}
             state.party = "Host: " .. host.name .. " | Carry: " .. carry.name .. " | " .. (#roster - 2) .. " selected alts"
         end
@@ -177,7 +177,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
                 for _, account in ipairs(roster) do
                     if request.name:lower() == account.name:lower() and account.id ~= host.id then allowed = true; break end
                 end
-                if active() and Adapter.ownerId() == host.id then
+                if active() then
                     Adapter.call("respondJoinRequest", id, allowed)
                     state.responded[id] = now
                     state.requests[id] = nil
@@ -213,7 +213,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
         -- Inventory tools must not depend on a valid party or dungeon catalog.
         inventoryWork(now)
         if not active() then
-            stop(); state.status = "Off — enable automation at the top of Party"; state.missingAt, state.readyAt, state.returning = nil, nil, false
+            stop(); state.status = "Off — enable automation at the top of Party"; state.missingAt, state.readyAt, state.returning, state.partySeen = nil, nil, false, false
             return
         end
         state.status = "Checking party setup"
@@ -277,24 +277,22 @@ function Roles.new(config, runtime, mode, controller, save, isAlive)
             end
             return
         end
-        local ownerId = Adapter.ownerId()
-        if not ownerId then
-            stop(); state.status = "Waiting for dungeon owner data"; return
-        end
-        assert(ownerId == host.id, "Dungeon owner ID " .. ownerId .. " does not match selected host " .. host.name .. " (" .. host.id .. ")")
+        -- Owner metadata is not reliable on first entry or after ownership transfers.
+        -- Role selection controls requests; the server validates owner-only actions.
         processRequests(now)
-        assert(next(runtime.Catalog), "Dungeon catalog unavailable; return to lobby once with automation enabled")
         if not active() then return end
         local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
         state.party = ready and (equal and "Party present; host and alts at the same level" or "Party present; waiting for levels to match")
-            or ("Missing / loading: " .. table.concat(missing, ", "))
-        if ready then state.missingAt = nil; state.readyAt = state.readyAt or now
+            or ("Missing: " .. table.concat(missing, ", "))
+        if ready then state.partySeen = true; state.missingAt = nil; state.readyAt = state.readyAt or now
         else state.readyAt = nil; state.missingAt = state.missingAt or now end
         if state.returning then returnLobby(state.status, now); return end
-        if config.OCD and not ready and now - state.missingAt >= config.RecoveryGrace then
+        local started = Adapter.PlaceManager.HasDungeonStarted()
+        -- Initial assembly has no timeout. Recover only a party that was assembled
+        -- or a run already in progress, so slow joins do not eject the host.
+        if config.OCD and (state.partySeen or started) and not ready and now - state.missingAt >= config.RecoveryGrace then
             returnLobby("OCD recovery: regrouping in lobby", now); return
         end
-        local started = Adapter.PlaceManager.HasDungeonStarted()
         if Adapter.failed() then state.Finish(true)
         elseif Adapter.finished() then state.Finish() end
         if state.finishedAt and now - state.finishedAt >= 5 and not state.rewardsRefreshed then

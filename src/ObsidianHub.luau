@@ -45,7 +45,8 @@ if env.autoloadconfig ~= false then
         if type(saved.MenuKey) == "string" then menuKey = saved.MenuKey end
     end
 end
-if env.autoloadconfig ~= false then
+-- A teleport snapshot belongs to this account and takes precedence over shared profiles.
+if env.autoloadconfig ~= false and type(resume) ~= "table" then
     local shared = readShared(partyPath)
     local party = shared and type(shared.Party) == "table" and shared.Party or table.clone(C)
     local detected = Logic.accountRole(party, player.Name, player.UserId)
@@ -221,7 +222,7 @@ local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
 toggle(options, "ProvisionHeals", "Farm Pirate Island for Universal Heal", nil, "Enable on every account. Uses eligible dungeons below level 60; leaves Pirate once the host and each selected alt own two Universal Heals and their levels match. The carry is excluded from heal requirements.")
-toggle(options, "OCD", "OCD: regroup after disconnects", nil, "Pauses carry farming when anyone is missing. After the grace period, return to lobby and reassemble.")
+toggle(options, "OCD", "OCD: regroup after disconnects", nil, "Pauses carry farming when anyone is missing. Waits indefinitely for initial arrivals; after an assembled party loses someone, returns to lobby after the grace period.")
 slider(options, "RecoveryGrace", "Recovery grace (seconds)", 15, 180)
 slider(options, "StartDelay", "Party-ready delay (seconds)", 0, 30)
 local status = partyTab:AddRightGroupbox("Live status")
