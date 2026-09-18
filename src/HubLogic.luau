@@ -4,6 +4,43 @@ Logic.Difficulties = { "Easy", "Medium", "Hard", "Insane", "Nightmare" }
 -- These seasonal entries currently lack reliable event flags in getDungeonStats.
 local seasonal = { ["Egg Island"] = true, Krampus = true, ["Tutorial Dungeon"] = true }
 
+-- Dungeon clients cannot open the lobby catalog UI. Keep the normal progression
+-- requirements here as a fallback, then let live getDungeonStats data override it
+-- whenever the host visits a lobby. This also lets old saved catalogs learn new maps.
+local requirements = {
+    ["Desert Temple"] = { Easy = 1, Medium = 6, Hard = 12, Insane = 20, Nightmare = 27 },
+    ["Winter Outpost"] = { Easy = 33, Medium = 40, Hard = 45, Insane = 50, Nightmare = 55 },
+    ["Pirate Island"] = { Insane = 60, Nightmare = 65 },
+    ["King's Castle"] = { Insane = 70, Nightmare = 75 },
+    ["The Underworld"] = { Insane = 80, Nightmare = 85 },
+    ["Samurai Palace"] = { Insane = 90, Nightmare = 95 },
+    ["The Canals"] = { Insane = 100, Nightmare = 105 },
+    ["Ghastly Harbor"] = { Insane = 110, Nightmare = 115 },
+    ["Steampunk Sewers"] = { Insane = 120, Nightmare = 125 },
+    ["Orbital Outpost"] = { Insane = 140, Nightmare = 145 },
+    ["Volcanic Chambers"] = { Insane = 150, Nightmare = 155 },
+    ["Aquatic Temple"] = { Insane = 160, Nightmare = 165 },
+    ["Enchanted Forest"] = { Insane = 170, Nightmare = 175 },
+    ["Northern Lands"] = { Insane = 180, Nightmare = 185 },
+}
+
+function Logic.catalog(live)
+    local result = {}
+    for dungeon, difficulties in pairs(requirements) do
+        result[dungeon] = {}
+        for difficulty, levelReq in pairs(difficulties) do
+            result[dungeon][difficulty] = { levelReq = levelReq }
+        end
+    end
+    for dungeon, difficulties in pairs(type(live) == "table" and live or {}) do
+        result[dungeon] = result[dungeon] or {}
+        for difficulty, data in pairs(type(difficulties) == "table" and difficulties or {}) do
+            if type(data) == "table" then result[dungeon][difficulty] = data end
+        end
+    end
+    return result
+end
+
 function Logic.tokens(text)
     local result, seen = {}, {}
     -- Roblox usernames and numeric IDs contain no whitespace. Accept pasted rows,
@@ -66,10 +103,18 @@ function Logic.isEquipped(item)
     return item.equipped ~= false
 end
 
+function Logic.slotEquipped(item, slot)
+    if type(item.equipped) ~= "table" then return false end
+    for name, value in pairs(item.equipped) do
+        if tostring(name):lower() == slot:lower() and value == true then return true end
+    end
+    return false
+end
+
 function Logic.heals(inventory)
     local result = {}
     for id, item in pairs(inventory.abilities or {}) do
-        if item.name == "Universal Heal" and tostring(id):match("^ability_%d+$") then
+        if Logic.normalizeItemName(item.name) == "universal heal" and tostring(id):match("^ability_%d+$") then
             table.insert(result, { id = tonumber(id:match("%d+$")), item = item })
         end
     end
@@ -104,6 +149,23 @@ function Logic.tankArmor(inventory, level)
         if best then table.insert(result, best) end
     end
     return result
+end
+
+function Logic.mageWeapon(inventory, level)
+    local best
+    for id, item in pairs(inventory.weapons or {}) do
+        local number = tonumber(tostring(id):match("^weapon_(%d+)$"))
+        local required = tonumber(item.levelReq)
+        local power = tonumber(item.spellPower) or 0
+        if number and required and required <= level and power > 0
+            and (not best or power > best.power
+                or power == best.power and required > best.required
+                or power == best.power and required == best.required and item.equipped == true and best.item.equipped ~= true
+                or power == best.power and required == best.required and item.equipped == best.item.equipped and number < best.id) then
+            best = { kind = "weapon", id = number, item = item, required = required, power = power }
+        end
+    end
+    return best
 end
 
 function Logic.normalizeItemName(name)

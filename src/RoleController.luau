@@ -8,7 +8,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
     local rosterKey, catalogReady = nil, false
     local healer = mode == "Dungeon" and AbilityController.new(player, function() end) or nil
-    runtime.Catalog = runtime.Catalog or {}
+    runtime.Catalog = Logic.catalog(runtime.Catalog)
     runtime.Heals = runtime.Heals or {}
     -- Previous releases stored booleans for the old one-heal target. Reinspect
     -- those accounts instead of treating an old true as two owned heals.
@@ -78,6 +78,17 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         local pirate = needsHeals() and Logic.bestDungeon(runtime.Catalog, level, true)
         return pirate or Logic.bestDungeon(runtime.Catalog, level, false)
     end
+
+    local function partyLevel(members)
+        local level
+        for _, member in ipairs(members or roster) do
+            if member.id ~= carry.id then
+                local observed = member.level or runtime.Levels[tostring(member.id)]
+                if observed then level = math.min(level or observed, observed) end
+            end
+        end
+        return level
+    end
     local function inventoryWork(now)
         if not config.AutoSell then state.sellStatus = "Auto sell: off" end
         local equipHealer = active() and config.Role == "Alt" and config.AutoHealer
@@ -111,6 +122,8 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             for _, entry in ipairs(Logic.tankArmor(inv, assert(Adapter.level()))) do
                 protected[entry.kind .. "_" .. entry.id] = true
             end
+            local weapon = Logic.mageWeapon(inv, assert(Adapter.level()))
+            if weapon then protected["weapon_" .. weapon.id] = true end
         end
         if equipHealer then
             local tank = Logic.tankArmor(inv, assert(Adapter.level()))
@@ -120,17 +133,24 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
                     Adapter.call("equipItem", entry.kind, entry.id)
                 end
             end
+            local weapon = Logic.mageWeapon(inv, assert(Adapter.level()))
+            if weapon then
+                protected["weapon_" .. weapon.id] = true
+                if weapon.item.equipped ~= true and active() and config.Role == "Alt" and config.AutoHealer then
+                    Adapter.call("equipItem", "weapon", weapon.id)
+                end
+            end
             local heals = Logic.heals(inv)
             local desired = { q = heals[1], e = heals[2] }
             for _, slot in ipairs({ "q", "e" }) do
                 local heal = desired[slot]
                 if heal then protected["ability_" .. heal.id] = true end
                 if not active() or config.Role ~= "Alt" or not config.AutoHealer then return end
-                if heal and not (type(heal.item.equipped) == "table" and heal.item.equipped[slot]) then
+                if heal and not Logic.slotEquipped(heal.item, slot) then
                     Adapter.call("equipItem", "ability", heal.id, slot)
                 elseif not heal then
                     for id, item in pairs(inv.abilities) do
-                        if type(item.equipped) == "table" and item.equipped[slot] and item.name ~= "Universal Heal" then
+                        if Logic.slotEquipped(item, slot) and Logic.normalizeItemName(item.name) ~= "universal heal" then
                             local number = tonumber(tostring(id):match("^ability_(%d+)$"))
                             if number then Adapter.call("unequipItem", "ability", number) end
                         end
@@ -252,11 +272,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
             if not config.AutoBest then state.status = "Auto best dungeon disabled"; return end
             -- Recovery may have left an alt behind. Use its last observed level as an eligibility ceiling.
-            local level = Adapter.level()
-            for _, member in ipairs(roster) do
-                local observed = runtime.Levels[tostring(member.id)]
-                if member.id ~= carry.id and observed then level = math.min(level, observed) end
-            end
+            local level = partyLevel(members) or Adapter.level()
             local chosen = assert(selection(level), "No eligible dungeon; refresh the lobby catalog")
             state.status = "Host: " .. chosen.Dungeon .. " / " .. chosen.Difficulty
             if due("queue", 5, now) and active() then
@@ -312,14 +328,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         local allHealed = config.ProvisionHeals and checkHeals(members, now)
         if not active() then return end
-        -- Presence/levels must be freshly observed, never inferred from a host leaving.
-        local hostLevel
-        for _, member in ipairs(members) do if member.id == host.id then hostLevel = member.level end end
-        local chosen = hostLevel and selection(hostLevel)
+        -- Choose for the lowest host/alt level so unequal XP never strands a lower
+        -- account in an old dungeon or sends it somewhere it cannot enter.
+        local eligibleLevel = partyLevel(members)
+        local chosen = eligibleLevel and selection(eligibleLevel)
         local current = Adapter.currentDungeon()
         local switchEnabled = config.Role == "Host" and config.AutoBest
             or config.Role ~= "Host" and config.AutoSwitch and not config.SyncEnabled
-        local switch = switchEnabled and ready and equal and chosen and not Logic.sameDungeon(chosen, current)
+        local switch = switchEnabled and ready and chosen and not Logic.sameDungeon(chosen, current)
         if state.finished then
             stop()
             if state.failed then state.status = "Run failed; waiting for the game to return to lobby"; return end

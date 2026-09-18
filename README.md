@@ -34,7 +34,7 @@ turning on its own toggle runs it even with role automation off or no party conf
 | --- | --- |
 | Carry | Sends requests to the host. Level Kaitun waits for the entire selected party, starts the dungeon, then uses the existing pathfinding combat farm. Pauses whenever a selected account is absent or its level is unavailable. |
 | Host | Creates and enters the best eligible dungeon, accepts requests only from the resolved selected accounts, and replays. Starts once everyone is present; keep Level Kaitun on for the host too, so owner-restricted starts work. |
-| Alt | Sends requests to the host. Optional healer equips the highest-level eligible tank helmet/chest and up to two Universal Heals, removes other equipped skills, and casts only Universal Heal when a selected member needs health. Optional skill points go to Stamina, Spell Power, or Physical Power. |
+| Alt | Sends requests to the host. Optional healer equips the strongest eligible mage weapon, highest-level tank helmet/chest, and up to two Universal Heals, removes other equipped skills, and casts only Universal Heal when a selected member needs health. Optional skill points go to Stamina, Spell Power, or Physical Power. |
 
 The carry alone runs the enemy pathfinding farm. Host and alt accounts wait for
 the carry; healer alts cast without approaching enemies. All roles support auto
@@ -42,9 +42,11 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
 
 ## Progression and party recovery
 
-- Best dungeon means the highest real level requirement available, with difficulty
-  used to break ties. Requirements come from the game's lobby catalog, including
-  later content; special event and boss-key dungeons are excluded.
+- Best dungeon means the highest real level requirement available to the lowest
+  selected host/alt level, with difficulty used to break ties. Live requirements
+  come from the lobby catalog; built-in normal-dungeon requirements through
+  Northern Lands keep progression working inside dungeons and repair old catalogs.
+  Special event and boss-key dungeons are excluded.
 - Hardcore and private/whitelist lobby mode are optional host settings. Automatic
   request acceptance **always** checks the selected party, even in a public lobby.
   The host scans existing request prompts once per second as well as listening for
@@ -52,8 +54,9 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
   Unresolved prompts are retried at most once every five seconds.
 - Before starting, every selected account must be present in the same dungeon.
   Readable matching non-carry levels are required for progression, not starting. The configurable party-ready delay gives arrivals time to settle.
-- At the end of a run, switching waits five seconds for rewards, verifies the host's
-  current level, and requires every selected non-carry account to match it. The host
+- At the end of a run, switching waits five seconds for rewards and chooses using
+  the lowest current host/alt level. Unequal XP does not hold the party in an old
+  dungeon, and the lower account is never sent above its requirement. The host
   returns to create the new dungeon; carry/alt accounts return and request the host
   again. Enable Auto Best on the host and Auto Switch on the carry/alts.
 - Starting and recovery do not depend on dungeon-owner metadata. Host role
@@ -63,26 +66,26 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
   on every account, a player missing from a previously assembled party (or an
   already-started run) for the grace period triggers lobby recovery. Requests and teleports are retried at bounded intervals.
 - Recovery remembers observed alt levels and caps the host's new selection at the
-  lowest known non-carry level so a disconnected alt is not locked out. The party
-  replays while levels differ. It cannot undo XP earned before a disconnect or
+  lowest known non-carry level so a disconnected alt is not locked out. It cannot undo XP earned before a disconnect or
   guarantee identical XP/levels when account XP boosts differ.
 
 ## Optional cross-client sync
 
-A small HTTPS relay lets separate devices report that their **scripts** are running,
+A relay lets clients report that their **scripts** are running,
 not just that their players are present. In Party → Cross-client sync, enter the same
 relay URL and private key on every selected account and enable the toggle on each.
 An optional private setup loader can set `getgenv().DQRewriteSync = { URL = "https://YOUR-RELAY.workers.dev", Key = "YOUR-PRIVATE-KEY" }`
 before running the regular main loader. These values save per account and continue
 through teleports. Never commit or publicly share the real key or setup loader.
 
-- Every account sends a heartbeat every 10 seconds. Starting, replaying, farming,
+- The local relay sends heartbeats every 0.5 seconds and expires missing clients
+  after five seconds. The Cloudflare fallback sends every 10 seconds. Starting, replaying, farming,
   and automatic healing require fresh enabled/ready reports from the entire party
   in the **same dungeon job**. The start delay resets when readiness is lost.
 - If the relay stops responding, clients pause these actions instead of assuming
   other scripts are ready. The UI lists missing, paused, or different-server accounts.
-- The host publishes a regroup message before its automated lobby return and waits
-  for relay acknowledgment. Carry and alts in the old job follow that message, even
+- The host publishes a regroup immediately before its automated lobby return and
+  waits for relay acknowledgment. Carry and alts in the old job follow that message, even
   if their own catalog is missing or they missed the host leaving. Level eligibility
   and reward checks still govern host progression. With sync enabled, followers use
   the host's progression decision instead of independently switching dungeons.
@@ -102,10 +105,16 @@ running accounts at the default interval use about 86,400 requests/day, before
 restarts and other traffic; the Free plan allowance is 100,000/day. Stay on Free:
 exceeding its quota stops requests rather than automatically buying extra capacity.
 
+For clients on one computer, run `npm run local` inside `src/relay`. Use
+`http://127.0.0.1:8788` for native desktop Roblox clients. Android emulators commonly
+reach the host at `http://10.0.2.2:8788`; otherwise use the host computer's private
+LAN address. The local server uses the same ignored `.dev.vars` key as Cloudflare,
+stores only short-lived memory, and needs to remain open while the accounts run.
+
 ## Healer provisioning and selling
 
 Enable **Farm Pirate Island for Universal Heal** on every account to coordinate
-provisioning. The host uses Pirate Island until the host and every selected alt
+provisioning. At level 60+, the host uses Pirate Island until the host and every selected alt
 each own at least **two Universal Heals**. The carry is excluded from heal ownership
 checks. Old one-heal readiness flags are discarded and inventories are checked again. Below Pirate Island's level-60
 requirement, it farms eligible content first. It selects the highest eligible
@@ -113,8 +122,8 @@ Pirate difficulty. The party returns to best-dungeon progression after ownership
 is confirmed and non-carry levels match. A failed inventory inspection does not
 establish ownership. New drops are checked again after rewards settle.
 
-Alt Auto Healer chooses tank/guardian armor by eligible **level first**, then
-health. A tank class/name or health-only armor stats identify tank gear. It equips
+Alt Auto Healer equips the eligible weapon with the highest spell power, then
+chooses tank/guardian armor by eligible **level first**, then health. A tank class/name or health-only armor stats identify tank gear. It equips
 two distinct heals when available; one is usable while waiting for another drop.
 Heal casting uses the game's equipped-slot event and cooldown path. The existing
 Auto Healer toggle alternates ready Q/E heals with at least four seconds between

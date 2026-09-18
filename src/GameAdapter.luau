@@ -58,7 +58,7 @@ function Adapter.catalog()
         end
     end
     assert(next(catalog), "Waiting for dungeon catalog")
-    return catalog
+    return Logic.catalog(catalog)
 end
 
 local identities = {}

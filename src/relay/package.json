@@ -2,6 +2,6 @@
   "name": "dungeonquest-party-relay",
   "private": true,
   "type": "module",
-  "scripts": { "dev": "wrangler dev", "deploy": "wrangler deploy", "test": "node --test worker.test.mjs" },
+  "scripts": { "dev": "wrangler dev", "local": "node local-server.mjs", "deploy": "wrangler deploy", "test": "node --test worker.test.mjs local-server.test.mjs" },
   "devDependencies": { "wrangler": "4.133.0" }
 }

@@ -11,6 +11,43 @@ Logic.Difficulties = { "Easy", "Medium", "Hard", "Insane", "Nightmare" }
 -- These seasonal entries currently lack reliable event flags in getDungeonStats.
 local seasonal = { ["Egg Island"] = true, Krampus = true, ["Tutorial Dungeon"] = true }
 
+-- Dungeon clients cannot open the lobby catalog UI. Keep the normal progression
+-- requirements here as a fallback, then let live getDungeonStats data override it
+-- whenever the host visits a lobby. This also lets old saved catalogs learn new maps.
+local requirements = {
+    ["Desert Temple"] = { Easy = 1, Medium = 6, Hard = 12, Insane = 20, Nightmare = 27 },
+    ["Winter Outpost"] = { Easy = 33, Medium = 40, Hard = 45, Insane = 50, Nightmare = 55 },
+    ["Pirate Island"] = { Insane = 60, Nightmare = 65 },
+    ["King's Castle"] = { Insane = 70, Nightmare = 75 },
+    ["The Underworld"] = { Insane = 80, Nightmare = 85 },
+    ["Samurai Palace"] = { Insane = 90, Nightmare = 95 },
+    ["The Canals"] = { Insane = 100, Nightmare = 105 },
+    ["Ghastly Harbor"] = { Insane = 110, Nightmare = 115 },
+    ["Steampunk Sewers"] = { Insane = 120, Nightmare = 125 },
+    ["Orbital Outpost"] = { Insane = 140, Nightmare = 145 },
+    ["Volcanic Chambers"] = { Insane = 150, Nightmare = 155 },
+    ["Aquatic Temple"] = { Insane = 160, Nightmare = 165 },
+    ["Enchanted Forest"] = { Insane = 170, Nightmare = 175 },
+    ["Northern Lands"] = { Insane = 180, Nightmare = 185 },
+}
+
+function Logic.catalog(live)
+    local result = {}
+    for dungeon, difficulties in pairs(requirements) do
+        result[dungeon] = {}
+        for difficulty, levelReq in pairs(difficulties) do
+            result[dungeon][difficulty] = { levelReq = levelReq }
+        end
+    end
+    for dungeon, difficulties in pairs(type(live) == "table" and live or {}) do
+        result[dungeon] = result[dungeon] or {}
+        for difficulty, data in pairs(type(difficulties) == "table" and difficulties or {}) do
+            if type(data) == "table" then result[dungeon][difficulty] = data end
+        end
+    end
+    return result
+end
+
 function Logic.tokens(text)
     local result, seen = {}, {}
     -- Roblox usernames and numeric IDs contain no whitespace. Accept pasted rows,
@@ -73,10 +110,18 @@ function Logic.isEquipped(item)
     return item.equipped ~= false
 end
 
+function Logic.slotEquipped(item, slot)
+    if type(item.equipped) ~= "table" then return false end
+    for name, value in pairs(item.equipped) do
+        if tostring(name):lower() == slot:lower() and value == true then return true end
+    end
+    return false
+end
+
 function Logic.heals(inventory)
     local result = {}
     for id, item in pairs(inventory.abilities or {}) do
-        if item.name == "Universal Heal" and tostring(id):match("^ability_%d+$") then
+        if Logic.normalizeItemName(item.name) == "universal heal" and tostring(id):match("^ability_%d+$") then
             table.insert(result, { id = tonumber(id:match("%d+$")), item = item })
         end
     end
@@ -111,6 +156,23 @@ function Logic.tankArmor(inventory, level)
         if best then table.insert(result, best) end
     end
     return result
+end
+
+function Logic.mageWeapon(inventory, level)
+    local best
+    for id, item in pairs(inventory.weapons or {}) do
+        local number = tonumber(tostring(id):match("^weapon_(%d+)$"))
+        local required = tonumber(item.levelReq)
+        local power = tonumber(item.spellPower) or 0
+        if number and required and required <= level and power > 0
+            and (not best or power > best.power
+                or power == best.power and required > best.required
+                or power == best.power and required == best.required and item.equipped == true and best.item.equipped ~= true
+                or power == best.power and required == best.required and item.equipped == best.item.equipped and number < best.id) then
+            best = { kind = "weapon", id = number, item = item, required = required, power = power }
+        end
+    end
+    return best
 end
 
 function Logic.normalizeItemName(name)
@@ -226,7 +288,7 @@ function Adapter.catalog()
         end
     end
     assert(next(catalog), "Waiting for dungeon catalog")
-    return catalog
+    return Logic.catalog(catalog)
 end
 
 local identities = {}
@@ -449,6 +511,16 @@ local PartySync = (function()
 -- Optional HTTPS relay. Network I/O runs outside the automation loop; stale
 -- replies never authorize starting or farming, even if a request hangs.
 local PartySync = {}
+local function relayKind(url)
+    if url:match("^https://[^/]+$") then return "remote" end
+    local host, port = url:match("^http://([^/:]+):(%d+)$")
+    if not host or tonumber(port) < 1 or tonumber(port) > 65535 then return nil end
+    if host == "localhost" or host == "127.0.0.1" or host == "10.0.2.2" then return "local" end
+    local a, b, c, d = host:match("^(%d+)%.(%d+)%.(%d+)%.(%d+)$")
+    a, b, c, d = tonumber(a), tonumber(b), tonumber(c), tonumber(d)
+    if not a or a > 255 or b > 255 or c > 255 or d > 255 then return nil end
+    if a == 10 or a == 192 and b == 168 or a == 172 and b >= 16 and b <= 31 then return "local" end
+end
 function PartySync.new(config, mode, isAlive)
     local Http = game:GetService("HttpService")
     local player = game:GetService("Players").LocalPlayer
@@ -480,7 +552,12 @@ function PartySync.new(config, mode, isAlive)
     function sync.Regroup(reason)
         reset()
         if not config.SyncEnabled or config.Role ~= "Host" then return true end
-        if not pending then pending = reason; acknowledged = false end
+        if not pending then
+            pending = reason; acknowledged = false
+            -- Publish host decisions on the next half-second loop instead of
+            -- waiting for an ordinary heartbeat interval.
+            lastAttempt = -math.huge
+        end
         return acknowledged
     end
     function sync.Command()
@@ -496,7 +573,9 @@ function PartySync.new(config, mode, isAlive)
         reset()
         if not config.SyncEnabled then sync.status = "Sync off"; return true end
         local now = os.clock()
-        if not response or not receivedAt or now - receivedAt > 20 then
+        local localRelay = relayKind(config.SyncURL:gsub("/+$", "")) == "local"
+        local responseLimit, memberLimit = localRelay and 3 or 20, localRelay and 5 or 35
+        if not response or not receivedAt or now - receivedAt > responseLimit then
             if response then sync.status = "Sync stale; waiting to reconnect" end
             return false
         end
@@ -507,7 +586,7 @@ function PartySync.new(config, mode, isAlive)
             local member = observed[account.id]
             if not member or member.mode ~= mode or member.jobId ~= game.JobId or member.placeId ~= game.PlaceId
                 or member.enabled ~= true or member.ready ~= true or type(member.age) ~= "number"
-                or member.age + now - receivedAt > 35 then table.insert(missing, account.name) end
+                or member.age + now - receivedAt > memberLimit then table.insert(missing, account.name) end
         end
         sync.status = #missing == 0 and "Sync: all scripts ready" or ("Sync waiting: " .. table.concat(missing, ", "))
         return #missing == 0
@@ -517,49 +596,54 @@ function PartySync.new(config, mode, isAlive)
             reset()
             local now = os.clock()
             if not config.SyncEnabled then sync.status = "Sync off"
-            elseif context and now - lastAttempt >= 10 then
-                lastAttempt = now
-                local request = request or http_request or (syn and syn.request)
+            elseif context then
                 local url = config.SyncURL:gsub("/+$", "")
-                if not url:match("^https://[^/]+$") or #config.SyncKey < 32 then
-                    response, receivedAt = nil, nil
-                    sync.status = "Sync: enter HTTPS relay URL and key (32+ characters)"
-                elseif type(request) ~= "function" then
-                    response, receivedAt = nil, nil
-                    sync.status = "Sync: executor HTTP requests unavailable"
-                else
-                    local sentGeneration = generation
-                    local sentSignature = lastSignature
-                    local sentAt = os.clock()
-                    local payload = {
-                        roster = context.roster, hostId = context.hostId, carryId = context.carryId,
-                        userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
-                        enabled = config.Enabled, ready = config.Enabled and context.ready and not pending and now - context.at < 5,
-                        regroup = pending,
-                    }
-                    local ok, result = pcall(function()
-                        local reply = request({ Url = url .. "/sync", Method = "POST", Timeout = 8,
-                            Headers = { ["Content-Type"] = "application/json", Authorization = "Bearer " .. config.SyncKey },
-                            Body = Http:JSONEncode(payload) })
-                        assert(reply and reply.StatusCode == 200, "Relay HTTP " .. tostring(reply and reply.StatusCode))
-                        local decoded = Http:JSONDecode(reply.Body)
-                        assert(decoded.protocol == 1 and type(decoded.members) == "table", "Invalid relay response")
-                        return decoded
-                    end)
-                    if not isAlive() then return end
-                    reset()
-                    if generation == sentGeneration and signature() == sentSignature then
-                        if ok and os.clock() - sentAt <= 8 then
-                            response, receivedAt = result, sentAt
-                            if pending and type(result.command) == "table" and result.command.jobId == game.JobId then acknowledged = true end
-                            sync.status = "Sync connected"
-                        else
-                            response, receivedAt = nil, nil
-                            sync.status = "Sync unavailable; waiting to reconnect"
+                local kind = relayKind(url)
+                local interval = kind == "local" and 0.5 or 10
+                if now - lastAttempt >= interval then
+                    lastAttempt = now
+                    local request = request or http_request or (syn and syn.request)
+                    if not kind or #config.SyncKey < 32 then
+                        response, receivedAt = nil, nil
+                        sync.status = "Sync: enter HTTPS or private local relay URL and key"
+                    elseif type(request) ~= "function" then
+                        response, receivedAt = nil, nil
+                        sync.status = "Sync: executor HTTP requests unavailable"
+                    else
+                        local sentGeneration = generation
+                        local sentSignature = lastSignature
+                        local sentAt = os.clock()
+                        local payload = {
+                            roster = context.roster, hostId = context.hostId, carryId = context.carryId,
+                            userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
+                            enabled = config.Enabled, ready = config.Enabled and context.ready and not pending and now - context.at < 5,
+                            regroup = pending,
+                        }
+                        local ok, result = pcall(function()
+                            local timeout = kind == "local" and 2 or 8
+                            local reply = request({ Url = url .. "/sync", Method = "POST", Timeout = timeout,
+                                Headers = { ["Content-Type"] = "application/json", Authorization = "Bearer " .. config.SyncKey },
+                                Body = Http:JSONEncode(payload) })
+                            assert(reply and reply.StatusCode == 200, "Relay HTTP " .. tostring(reply and reply.StatusCode))
+                            local decoded = Http:JSONDecode(reply.Body)
+                            assert(decoded.protocol == 1 and type(decoded.members) == "table", "Invalid relay response")
+                            return decoded
+                        end)
+                        if not isAlive() then return end
+                        reset()
+                        if generation == sentGeneration and signature() == sentSignature then
+                            if ok and os.clock() - sentAt <= (kind == "local" and 2 or 8) then
+                                response, receivedAt = result, sentAt
+                                if pending and type(result.command) == "table" and result.command.jobId == game.JobId then acknowledged = true end
+                                sync.status = "Sync connected"
+                            else
+                                response, receivedAt = nil, nil
+                                sync.status = "Sync unavailable; waiting to reconnect"
+                            end
                         end
                     end
                 end
-            elseif not context then sync.status = "Sync: waiting for valid party setup" end
+            else sync.status = "Sync: waiting for valid party setup" end
             task.wait(0.5)
         end
     end)
@@ -579,7 +663,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
     local rosterKey, catalogReady = nil, false
     local healer = mode == "Dungeon" and AbilityController.new(player, function() end) or nil
-    runtime.Catalog = runtime.Catalog or {}
+    runtime.Catalog = Logic.catalog(runtime.Catalog)
     runtime.Heals = runtime.Heals or {}
     -- Previous releases stored booleans for the old one-heal target. Reinspect
     -- those accounts instead of treating an old true as two owned heals.
@@ -649,6 +733,17 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         local pirate = needsHeals() and Logic.bestDungeon(runtime.Catalog, level, true)
         return pirate or Logic.bestDungeon(runtime.Catalog, level, false)
     end
+
+    local function partyLevel(members)
+        local level
+        for _, member in ipairs(members or roster) do
+            if member.id ~= carry.id then
+                local observed = member.level or runtime.Levels[tostring(member.id)]
+                if observed then level = math.min(level or observed, observed) end
+            end
+        end
+        return level
+    end
     local function inventoryWork(now)
         if not config.AutoSell then state.sellStatus = "Auto sell: off" end
         local equipHealer = active() and config.Role == "Alt" and config.AutoHealer
@@ -682,6 +777,8 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             for _, entry in ipairs(Logic.tankArmor(inv, assert(Adapter.level()))) do
                 protected[entry.kind .. "_" .. entry.id] = true
             end
+            local weapon = Logic.mageWeapon(inv, assert(Adapter.level()))
+            if weapon then protected["weapon_" .. weapon.id] = true end
         end
         if equipHealer then
             local tank = Logic.tankArmor(inv, assert(Adapter.level()))
@@ -691,17 +788,24 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
                     Adapter.call("equipItem", entry.kind, entry.id)
                 end
             end
+            local weapon = Logic.mageWeapon(inv, assert(Adapter.level()))
+            if weapon then
+                protected["weapon_" .. weapon.id] = true
+                if weapon.item.equipped ~= true and active() and config.Role == "Alt" and config.AutoHealer then
+                    Adapter.call("equipItem", "weapon", weapon.id)
+                end
+            end
             local heals = Logic.heals(inv)
             local desired = { q = heals[1], e = heals[2] }
             for _, slot in ipairs({ "q", "e" }) do
                 local heal = desired[slot]
                 if heal then protected["ability_" .. heal.id] = true end
                 if not active() or config.Role ~= "Alt" or not config.AutoHealer then return end
-                if heal and not (type(heal.item.equipped) == "table" and heal.item.equipped[slot]) then
+                if heal and not Logic.slotEquipped(heal.item, slot) then
                     Adapter.call("equipItem", "ability", heal.id, slot)
                 elseif not heal then
                     for id, item in pairs(inv.abilities) do
-                        if type(item.equipped) == "table" and item.equipped[slot] and item.name ~= "Universal Heal" then
+                        if Logic.slotEquipped(item, slot) and Logic.normalizeItemName(item.name) ~= "universal heal" then
                             local number = tonumber(tostring(id):match("^ability_(%d+)$"))
                             if number then Adapter.call("unequipItem", "ability", number) end
                         end
@@ -823,11 +927,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
             if not config.AutoBest then state.status = "Auto best dungeon disabled"; return end
             -- Recovery may have left an alt behind. Use its last observed level as an eligibility ceiling.
-            local level = Adapter.level()
-            for _, member in ipairs(roster) do
-                local observed = runtime.Levels[tostring(member.id)]
-                if member.id ~= carry.id and observed then level = math.min(level, observed) end
-            end
+            local level = partyLevel(members) or Adapter.level()
             local chosen = assert(selection(level), "No eligible dungeon; refresh the lobby catalog")
             state.status = "Host: " .. chosen.Dungeon .. " / " .. chosen.Difficulty
             if due("queue", 5, now) and active() then
@@ -883,14 +983,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         local allHealed = config.ProvisionHeals and checkHeals(members, now)
         if not active() then return end
-        -- Presence/levels must be freshly observed, never inferred from a host leaving.
-        local hostLevel
-        for _, member in ipairs(members) do if member.id == host.id then hostLevel = member.level end end
-        local chosen = hostLevel and selection(hostLevel)
+        -- Choose for the lowest host/alt level so unequal XP never strands a lower
+        -- account in an old dungeon or sends it somewhere it cannot enter.
+        local eligibleLevel = partyLevel(members)
+        local chosen = eligibleLevel and selection(eligibleLevel)
         local current = Adapter.currentDungeon()
         local switchEnabled = config.Role == "Host" and config.AutoBest
             or config.Role ~= "Host" and config.AutoSwitch and not config.SyncEnabled
-        local switch = switchEnabled and ready and equal and chosen and not Logic.sameDungeon(chosen, current)
+        local switch = switchEnabled and ready and chosen and not Logic.sameDungeon(chosen, current)
         if state.finished then
             stop()
             if state.failed then state.status = "Run failed; waiting for the game to return to lobby"; return end
@@ -1174,15 +1274,15 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
 local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
-toggle(syncGroup, "SyncEnabled", "Require scripts ready through relay", nil, "Enable on every selected account. Waits for fresh script heartbeats in the same dungeon and follows host regroup messages.")
-input(syncGroup, "SyncURL", "Relay HTTPS URL")
+toggle(syncGroup, "SyncEnabled", "Require scripts ready through relay", nil, "Enable on every selected account. A local relay updates in under a second; HTTPS is the remote fallback.")
+input(syncGroup, "SyncURL", "Relay URL (local HTTP or HTTPS)")
 input(syncGroup, "SyncKey", "Private relay key")
 syncGroup:AddLabel("Use the same relay URL and key on every account. This does not execute scripts on other accounts.", true)
 local syncLabel = syncGroup:AddLabel("Sync off", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
-toggle(options, "ProvisionHeals", "Farm Pirate Island for Universal Heal", nil, "Enable on every account. Uses eligible dungeons below level 60; leaves Pirate once the host and each selected alt own two Universal Heals and their levels match. The carry is excluded from heal requirements.")
+toggle(options, "ProvisionHeals", "Farm Pirate Island for Universal Heal", nil, "Enable on every account. Chooses Pirate at level 60+, then leaves after the host and selected alts each own two Universal Heals. The carry is excluded.")
 toggle(options, "OCD", "OCD: regroup after disconnects", nil, "Pauses carry farming when anyone is missing. Waits indefinitely for initial arrivals; after an assembled party loses someone, returns to lobby after the grace period.")
 slider(options, "RecoveryGrace", "Recovery grace (seconds)", 15, 180)
 slider(options, "StartDelay", "Party-ready delay (seconds)", 0, 30)
@@ -1200,13 +1300,13 @@ toggle(carry, "AutoDodge", "Pathfinding hazard avoidance")
 local join = roleTab:AddLeftGroupbox("Carry and alt")
 toggle(join, "AutoJoin", "Send join requests to host")
 slider(join, "JoinInterval", "Join request interval (seconds)", 5, 60)
-toggle(join, "AutoSwitch", "Switch when host unlocks better dungeon", nil, "Waits for the run to finish and host/alt levels to match. A host leaving is not an unlock signal.")
+toggle(join, "AutoSwitch", "Switch to best party dungeon", nil, "After a run, selects for the lowest host/alt level. Unequal XP no longer prevents switching.")
 local host = roleTab:AddRightGroupbox("2 · Host")
 toggle(host, "AutoBest", "Create and join best eligible dungeon", nil, "Runs when this account is set to Host and role automation is enabled.")
 toggle(host, "AutoAccept", "Accept selected accounts only")
-host:AddLabel("Creates the dungeon, accepts the party, and replays until the host and selected alts match levels. Keep Level Kaitun enabled to start once everyone arrives.", true)
+host:AddLabel("Creates the best dungeon the lowest host/alt can enter, accepts the party, and starts once everyone arrives.", true)
 local alt = roleTab:AddRightGroupbox("3 · Alt")
-toggle(alt, "AutoHealer", "Tank armor + Universal Heal only", nil, "Equips the highest eligible tank helmet/chest and up to two Universal Heals. Alternates ready heals at least 4 seconds apart when a selected party member needs healing.")
+toggle(alt, "AutoHealer", "Healer loadout + Universal Heal", nil, "Equips the strongest eligible mage weapon, tank helmet/chest, and up to two Universal Heals. Alternates heals when the party needs health.")
 toggle(alt, "AutoSkillPoints", "Auto allocate skill points")
 dropdown(alt, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
 local inventory = settingsTab:AddLeftGroupbox("All account types")

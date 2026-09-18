@@ -3,6 +3,16 @@
 This Worker supports the hub's optional cross-client script readiness and host
 regroup messages. No Roblox login, cookies, or game passwords are needed.
 
+## Fast same-machine mode
+
+Run `npm run local` and leave that terminal open. It reads the ignored `.dev.vars`
+key already used for Cloudflare, listens on port 8788, updates every 0.5 seconds,
+and keeps all state in memory. Native desktop clients use
+`http://127.0.0.1:8788`. Android emulators commonly use
+`http://10.0.2.2:8788`; if that gateway is unavailable, use the host's private LAN
+IP and allow inbound TCP 8788 in the local firewall. The key is still required.
+Only loopback, Android's common host gateway, and private LAN HTTP URLs are accepted.
+
 Use Cloudflare **Workers Free**, without upgrading billing. The
 [Free limits](https://developers.cloudflare.com/durable-objects/platform/pricing/)
 include 100,000 Durable Object requests/day; Workers has its own matching daily
