@@ -66,10 +66,16 @@ if env.autoloadconfig ~= false and type(resume) ~= "table" then
         if type(party[key]) == "string" then C[key] = party[key] end
     end
 end
--- A private setup loader can configure the relay without publishing credentials.
+-- Setup loaders can enable shared files alone or add a relay fallback.
 local syncSetup = env.DQRewriteSync
-if type(syncSetup) == "table" and type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string" then
-    C.SyncURL, C.SyncKey, C.SyncEnabled = syncSetup.URL, syncSetup.Key, true
+if type(syncSetup) == "table" and (syncSetup.Files == true
+    or type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string") then
+    if syncSetup.Files == true then
+        C.SyncURL, C.SyncKey = "", ""
+    else
+        C.SyncURL, C.SyncKey = syncSetup.URL, syncSetup.Key
+    end
+    C.SyncEnabled = true
     env.DQRewriteSync = nil
 end
 if not table.find({ "Carry", "Host", "Alt" }, C.Role) then C.Role = "Carry"; C.Enabled = false end
@@ -229,10 +235,10 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
 local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
-toggle(syncGroup, "SyncEnabled", "Require scripts ready through relay", nil, "Enable on every selected account. A local relay updates in under a second; HTTPS is the remote fallback.")
-input(syncGroup, "SyncURL", "Relay URL (local HTTP or HTTPS)")
+toggle(syncGroup, "SyncEnabled", "Require selected scripts ready", nil, "Uses shared executor files automatically. A configured relay is only a fallback when client workspaces are isolated.")
+input(syncGroup, "SyncURL", "Optional relay fallback URL")
 input(syncGroup, "SyncKey", "Private relay key")
-syncGroup:AddLabel("Use the same relay URL and key on every account. This does not execute scripts on other accounts.", true)
+syncGroup:AddLabel("Same-device clients first try heartbeat files in the executor workspace. No command or local server is needed when those files are shared.", true)
 local syncLabel = syncGroup:AddLabel("Sync off", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")

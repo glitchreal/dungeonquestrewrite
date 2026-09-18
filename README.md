@@ -71,33 +71,32 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
 
 ## Optional cross-client sync
 
-A relay lets clients report that their **scripts** are running,
-not just that their players are present. In Party → Cross-client sync, enter the same
-relay URL and private key on every selected account and enable the toggle on each.
-An optional private setup loader can set `getgenv().DQRewriteSync = { URL = "https://YOUR-RELAY.workers.dev", Key = "YOUR-PRIVATE-KEY" }`
-before running the regular main loader. These values save per account and continue
-through teleports. Never commit or publicly share the real key or setup loader.
+Cross-client sync reports that every selected **script** is running, not merely
+that each player is present. On one device, use `files.luau` on every account or
+enable **Require selected scripts ready** in Party. No relay, key, command, port,
+or background process is required when the executor clients share one workspace.
 
-- The local relay sends heartbeats every 0.5 seconds and expires missing clients
-  after five seconds. The Cloudflare fallback sends every 10 seconds. Starting, replaying, farming,
-  and automatic healing require fresh enabled/ready reports from the entire party
-  in the **same dungeon job**. The start delay resets when readiness is lost.
-- If the relay stops responding, clients pause these actions instead of assuming
-  other scripts are ready. The UI lists missing, paused, or different-server accounts.
-- The host publishes a regroup immediately before its automated lobby return and
-  waits for relay acknowledgment. Carry and alts in the old job follow that message, even
-  if their own catalog is missing or they missed the host leaving. Level eligibility
-  and reward checks still govern host progression. With sync enabled, followers use
-  the host's progression decision instead of independently switching dungeons.
-- Regroup messages expire after three minutes and target only the old job. Ordinary
-  missing-player OCD recovery still works independently on carry/alt clients.
-- Disabling sync restores the presence-only behavior. The manual Return to lobby
-  button remains an individual action. Sync cannot inject or execute a script on
-  another account: run the loader on each account and keep teleport execution enabled.
-- Executors need an HTTPS `request`, `http_request`, or `syn.request` API. Settings
-  files and the private key remain local; the relay only receives party IDs, server
-  IDs, place, enabled/readiness flags, and regroup reasons. Party members sharing a
-  key are trusted: this is a private coordination service, not Roblox identity proof.
+- Each account writes only its own heartbeat file every 0.25 seconds. Readers
+  require all fresh heartbeats to name the same dungeon job and place, and to report
+  enabled and ready. Brief partial writes are ignored until the next heartbeat.
+- The host writes one job-scoped regroup command before leaving. Carry and alts
+  read it directly and follow; commands expire after 30 seconds and cannot eject a
+  newly teleported party from a different job.
+- Stale heartbeat files are harmless and may remain on disk. Timestamps and job IDs
+  prevent them from authorizing a future start. No client enumerates arbitrary
+  workspace content because roster IDs determine the exact files to read.
+- Once every account's heartbeat has been observed, the script stays on file sync
+  and fails closed if one becomes stale, disabled, paused, or moves to another job.
+- Some executors isolate each Roblox process in a separate virtual workspace. Until
+  shared files are proven, a configured HTTP relay remains an automatic fallback.
+  Without either path, the UI reports that sync is unavailable instead of starting.
+- Disabling sync restores presence-only behavior. Sync cannot inject or execute the
+  loader on another account, so run it on each account and keep teleport execution enabled.
+
+An optional private relay loader can still set
+`getgenv().DQRewriteSync = { URL = "https://YOUR-RELAY.workers.dev", Key = "YOUR-PRIVATE-KEY" }`.
+Never commit or publicly share a real relay key. File sync takes priority if the
+workspace proves shared, so existing relay-enabled loaders gain the faster path too.
 
 The deployable Cloudflare Worker is in [`src/relay`](src/relay/README.md). It uses a
 SQLite-backed Durable Object supported by the Workers Free plan. Ten continuously
@@ -105,7 +104,8 @@ running accounts at the default interval use about 86,400 requests/day, before
 restarts and other traffic; the Free plan allowance is 100,000/day. Stay on Free:
 exceeding its quota stops requests rather than automatically buying extra capacity.
 
-For clients on one computer, run `npm run local` inside `src/relay`. Use
+If files are isolated but local HTTP is available, run `npm run local` inside
+`src/relay`. Use
 `http://127.0.0.1:8788` for native desktop Roblox clients. Android emulators commonly
 reach the host at `http://10.0.2.2:8788`; otherwise use the host computer's private
 LAN address. The local server uses the same ignored `.dev.vars` key as Cloudflare,
@@ -164,6 +164,8 @@ Files in the executor workspace:
 - `DungeonQuestRewrite-party.json`: shared Host, Carry, and Selected alts.
 - `DungeonQuestRewrite-role-Carry.json`, `-Host.json`, `-Alt.json`: settings per role.
 - `DungeonQuestRewrite-<userId>.json`: account fallback and runtime observations.
+- `DungeonQuestRewrite-sync/<party-id>/<userId>.json`: per-account sync heartbeat.
+- `DungeonQuestRewrite-sync/<party-id>/command.json`: short-lived host regroup command.
 
 Role profiles publish on user edits. Periodic saves and teleports update only the
 account file, so idle accounts do not overwrite shared settings. An in-memory

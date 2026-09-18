@@ -508,9 +508,10 @@ return Abilities
 
 end)()
 local PartySync = (function()
--- Optional HTTPS relay. Network I/O runs outside the automation loop; stale
--- replies never authorize starting or farming, even if a request hangs.
+-- Same-workspace files are the fastest sync path and need no background process.
+-- The HTTP relay remains a fallback when executor instances isolate their files.
 local PartySync = {}
+
 local function relayKind(url)
     if url:match("^https://[^/]+$") then return "remote" end
     local host, port = url:match("^http://([^/:]+):(%d+)$")
@@ -521,12 +522,24 @@ local function relayKind(url)
     if not a or a > 255 or b > 255 or c > 255 or d > 255 then return nil end
     if a == 10 or a == 192 and b == 168 or a == 172 and b >= 16 and b <= 31 then return "local" end
 end
+
+local function wallTime()
+    if DateTime and type(DateTime.now) == "function" then return DateTime.now().UnixTimestampMillis / 1000 end
+    return os.time()
+end
+
 function PartySync.new(config, mode, isAlive)
     local Http = game:GetService("HttpService")
     local player = game:GetService("Players").LocalPlayer
     local sync = { status = "Sync off" }
     local context, response, receivedAt, pending, acknowledged, lastAttempt = nil, nil, nil, nil, false, -math.huge
     local generation = 0
+    local files = {
+        available = type(writefile) == "function" and type(readfile) == "function"
+            and type(isfile) == "function" and type(makefolder) == "function",
+        room = nil, shared = false, lastWrite = -math.huge,
+    }
+
     local function signature()
         return table.concat({ tostring(config.SyncEnabled), config.SyncURL, config.SyncKey,
             config.Role, config.Host, config.Carry, config.Alts }, "|")
@@ -538,47 +551,65 @@ function PartySync.new(config, mode, isAlive)
             lastSignature = value; generation = generation + 1
             context, response, receivedAt, pending, acknowledged = nil, nil, nil, nil, false
             lastAttempt = -math.huge
+            files.room, files.shared, files.lastWrite = nil, false, -math.huge
         end
     end
-    function sync.Update(roster, host, carry, ready)
-        reset()
-        local ids = {}
-        for _, account in ipairs(roster) do table.insert(ids, account.id) end
-        context = { roster = ids, hostId = host.id, carryId = carry.id, ready = ready, at = os.clock() }
+    local function ensureFolder(path)
+        if type(isfolder) == "function" and isfolder(path) then return true end
+        return pcall(makefolder, path)
     end
-    function sync.Pause()
-        if context then context.ready = false end
+    local function readJSON(path)
+        if not files.available or not path or not isfile(path) then return nil end
+        local ok, value = pcall(function() return Http:JSONDecode(readfile(path)) end)
+        return ok and type(value) == "table" and value or nil
     end
-    function sync.Regroup(reason)
-        reset()
-        if not config.SyncEnabled or config.Role ~= "Host" then return true end
-        if not pending then
-            pending = reason; acknowledged = false
-            -- Publish host decisions on the next half-second loop instead of
-            -- waiting for an ordinary heartbeat interval.
-            lastAttempt = -math.huge
+    local function writeJSON(path, value)
+        if not files.available or not path then return false end
+        return pcall(function() writefile(path, Http:JSONEncode(value)) end)
+    end
+    local function setupRoom(ids, hostId, carryId)
+        if not files.available then return end
+        local sorted = table.clone(ids)
+        table.sort(sorted)
+        local root = "DungeonQuestRewrite-sync"
+        local room = root .. "/" .. hostId .. "_" .. carryId .. "_" .. table.concat(sorted, "-")
+        if not ensureFolder(root) or not ensureFolder(room) then files.available = false; return end
+        files.room = room
+    end
+    local function heartbeatPath(id) return files.room and (files.room .. "/" .. id .. ".json") end
+    local function commandPath() return files.room and (files.room .. "/command.json") end
+    local function fresh(entry, limit)
+        if type(entry) ~= "table" or type(entry.at) ~= "number" then return false end
+        local age = wallTime() - entry.at
+        return age >= -5 and age <= limit
+    end
+    local function writeHeartbeat(now)
+        if not files.room or not context or now - files.lastWrite < 0.25 then return end
+        files.lastWrite = now
+        writeJSON(heartbeatPath(player.UserId), {
+            version = 1, userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
+            enabled = config.Enabled, ready = config.Enabled and context.ready and now - context.at < 2,
+            at = wallTime(),
+        })
+    end
+    local function fileReadiness(roster)
+        if not files.room then return false, nil end
+        local missing, visible = {}, 0
+        for _, account in ipairs(roster) do
+            local member = readJSON(heartbeatPath(account.id))
+            local seen = fresh(member, 3) and member.userId == account.id
+            if seen then visible = visible + 1 end
+            if not seen or member.mode ~= mode or member.jobId ~= game.JobId or member.placeId ~= game.PlaceId
+                or member.enabled ~= true or member.ready ~= true then table.insert(missing, account.name) end
         end
-        return acknowledged
+        if visible == #roster then files.shared = true end
+        return #missing == 0, missing
     end
-    function sync.Command()
-        reset()
-        if config.SyncEnabled and response and receivedAt and os.clock() - receivedAt <= 20 then
-            local command = response.command
-            if type(command) == "table" and command.jobId == game.JobId and type(command.reason) == "string" then
-                return command.reason
-            end
-        end
-    end
-    function sync.Ready(roster)
-        reset()
-        if not config.SyncEnabled then sync.status = "Sync off"; return true end
+    local function relayReadiness(roster)
         local now = os.clock()
         local localRelay = relayKind(config.SyncURL:gsub("/+$", "")) == "local"
         local responseLimit, memberLimit = localRelay and 3 or 20, localRelay and 5 or 35
-        if not response or not receivedAt or now - receivedAt > responseLimit then
-            if response then sync.status = "Sync stale; waiting to reconnect" end
-            return false
-        end
+        if not response or not receivedAt or now - receivedAt > responseLimit then return false, nil end
         local observed = {}
         for _, member in ipairs(response.members) do observed[member.userId] = member end
         local missing = {}
@@ -588,28 +619,80 @@ function PartySync.new(config, mode, isAlive)
                 or member.enabled ~= true or member.ready ~= true or type(member.age) ~= "number"
                 or member.age + now - receivedAt > memberLimit then table.insert(missing, account.name) end
         end
-        sync.status = #missing == 0 and "Sync: all scripts ready" or ("Sync waiting: " .. table.concat(missing, ", "))
-        return #missing == 0
+        return #missing == 0, missing
     end
+
+    function sync.Update(roster, host, carry, ready)
+        reset()
+        local ids = {}
+        for _, account in ipairs(roster) do table.insert(ids, account.id) end
+        context = { roster = ids, hostId = host.id, carryId = carry.id, ready = ready, at = os.clock() }
+        if not files.room then setupRoom(ids, host.id, carry.id) end
+    end
+    function sync.Pause()
+        if context then context.ready = false end
+        files.lastWrite = -math.huge
+    end
+    function sync.Regroup(reason)
+        reset()
+        if not config.SyncEnabled or config.Role ~= "Host" then return true end
+        if files.shared and writeJSON(commandPath(), {
+            version = 1, jobId = game.JobId, reason = reason, at = wallTime(),
+        }) then return true end
+        if not pending then pending = reason; acknowledged = false; lastAttempt = -math.huge end
+        return acknowledged
+    end
+    function sync.Command()
+        reset()
+        if not config.SyncEnabled then return nil end
+        local command = readJSON(commandPath())
+        if fresh(command, 30) and command.jobId == game.JobId and type(command.reason) == "string" then
+            return command.reason
+        end
+        local responseLimit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 3 or 20
+        if response and receivedAt and os.clock() - receivedAt <= responseLimit then
+            command = response.command
+            if type(command) == "table" and command.jobId == game.JobId and type(command.reason) == "string" then
+                return command.reason
+            end
+        end
+    end
+    function sync.Ready(roster)
+        reset()
+        if not config.SyncEnabled then sync.status = "Sync off"; return true end
+        local ready, missing = fileReadiness(roster)
+        if ready then sync.status = "File sync: all scripts ready"; return true end
+        if files.shared then
+            sync.status = "File sync waiting: " .. table.concat(missing, ", ")
+            return false
+        end
+        local relayReady, relayMissing = relayReadiness(roster)
+        if relayReady then sync.status = "Relay sync: all scripts ready"; return true end
+        local waiting = missing or relayMissing
+        if files.available then
+            sync.status = waiting and ("Looking for shared files: " .. table.concat(waiting, ", ")) or "Looking for shared executor workspace"
+        elseif relayMissing then
+            sync.status = "Relay waiting: " .. table.concat(relayMissing, ", ")
+        else
+            sync.status = "Sync unavailable: executor files are isolated and relay is offline"
+        end
+        return false
+    end
+
     task.spawn(function()
         while isAlive() do
             reset()
             local now = os.clock()
             if not config.SyncEnabled then sync.status = "Sync off"
             elseif context then
+                writeHeartbeat(now)
                 local url = config.SyncURL:gsub("/+$", "")
                 local kind = relayKind(url)
                 local interval = kind == "local" and 0.5 or 10
-                if now - lastAttempt >= interval then
+                if kind and #config.SyncKey >= 32 and now - lastAttempt >= interval then
                     lastAttempt = now
                     local request = request or http_request or (syn and syn.request)
-                    if not kind or #config.SyncKey < 32 then
-                        response, receivedAt = nil, nil
-                        sync.status = "Sync: enter HTTPS or private local relay URL and key"
-                    elseif type(request) ~= "function" then
-                        response, receivedAt = nil, nil
-                        sync.status = "Sync: executor HTTP requests unavailable"
-                    else
+                    if type(request) == "function" then
                         local sentGeneration = generation
                         local sentSignature = lastSignature
                         local sentAt = os.clock()
@@ -635,16 +718,12 @@ function PartySync.new(config, mode, isAlive)
                             if ok and os.clock() - sentAt <= (kind == "local" and 2 or 8) then
                                 response, receivedAt = result, sentAt
                                 if pending and type(result.command) == "table" and result.command.jobId == game.JobId then acknowledged = true end
-                                sync.status = "Sync connected"
-                            else
-                                response, receivedAt = nil, nil
-                                sync.status = "Sync unavailable; waiting to reconnect"
-                            end
+                            else response, receivedAt = nil, nil end
                         end
                     end
                 end
             else sync.status = "Sync: waiting for valid party setup" end
-            task.wait(0.5)
+            task.wait(0.25)
         end
     end)
     return sync
@@ -3748,10 +3827,16 @@ if env.autoloadconfig ~= false and type(resume) ~= "table" then
         if type(party[key]) == "string" then C[key] = party[key] end
     end
 end
--- A private setup loader can configure the relay without publishing credentials.
+-- Setup loaders can enable shared files alone or add a relay fallback.
 local syncSetup = env.DQRewriteSync
-if type(syncSetup) == "table" and type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string" then
-    C.SyncURL, C.SyncKey, C.SyncEnabled = syncSetup.URL, syncSetup.Key, true
+if type(syncSetup) == "table" and (syncSetup.Files == true
+    or type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string") then
+    if syncSetup.Files == true then
+        C.SyncURL, C.SyncKey = "", ""
+    else
+        C.SyncURL, C.SyncKey = syncSetup.URL, syncSetup.Key
+    end
+    C.SyncEnabled = true
     env.DQRewriteSync = nil
 end
 if not table.find({ "Carry", "Host", "Alt" }, C.Role) then C.Role = "Carry"; C.Enabled = false end
@@ -3911,10 +3996,10 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
 local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
-toggle(syncGroup, "SyncEnabled", "Require scripts ready through relay", nil, "Enable on every selected account. A local relay updates in under a second; HTTPS is the remote fallback.")
-input(syncGroup, "SyncURL", "Relay URL (local HTTP or HTTPS)")
+toggle(syncGroup, "SyncEnabled", "Require selected scripts ready", nil, "Uses shared executor files automatically. A configured relay is only a fallback when client workspaces are isolated.")
+input(syncGroup, "SyncURL", "Optional relay fallback URL")
 input(syncGroup, "SyncKey", "Private relay key")
-syncGroup:AddLabel("Use the same relay URL and key on every account. This does not execute scripts on other accounts.", true)
+syncGroup:AddLabel("Same-device clients first try heartbeat files in the executor workspace. No command or local server is needed when those files are shared.", true)
 local syncLabel = syncGroup:AddLabel("Sync off", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
