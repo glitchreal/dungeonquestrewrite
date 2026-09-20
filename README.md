@@ -34,10 +34,11 @@ turning on its own toggle runs it even with role automation off or no party conf
 | --- | --- |
 | Carry | Sends requests to the host. Level Kaitun waits for the entire selected party, starts the dungeon, then uses the existing pathfinding combat farm. Pauses whenever a selected account is absent or its level is unavailable. |
 | Host | Creates and enters the best eligible dungeon, accepts requests only from the resolved selected accounts, and replays. Starts once everyone is present; keep Level Kaitun on for the host too, so owner-restricted starts work. |
-| Alt | Sends requests to the host. Optional healer equips the strongest eligible mage weapon, highest-level tank helmet/chest, and up to two Universal Heals, removes other equipped skills, and casts only Universal Heal when a selected member needs health. Optional skill points go to Stamina, Spell Power, or Physical Power. |
+| Alt | Sends requests to the host. Optional healer support matches the Host behavior below. |
+| Host and Alt healer support | Equips the strongest eligible mage weapon, highest-level tank helmet/chest, and up to two Universal Heals, removes other equipped skills, and casts only Universal Heal when a selected member needs health. Optional skill points go to Stamina, Spell Power, or Physical Power. |
 
 The carry alone runs the enemy pathfinding farm. Host and alt accounts wait for
-the carry; healer alts cast without approaching enemies. All roles support auto
+the carry; healer hosts and alts cast without approaching enemies. All roles support auto
 sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport continuation.
 
 ## Progression and party recovery
@@ -122,7 +123,7 @@ Pirate difficulty. The party returns to best-dungeon progression after ownership
 is confirmed and non-carry levels match. A failed inventory inspection does not
 establish ownership. New drops are checked again after rewards settle.
 
-Alt Auto Healer equips the eligible weapon with the highest spell power, then
+Host and Alt Auto Healer equips the eligible weapon with the highest spell power, then
 chooses tank/guardian armor by eligible **level first**, then health. A tank class/name or health-only armor stats identify tank gear. It equips
 two distinct heals when available; one is usable while waiting for another drop.
 Heal casting uses the game's equipped-slot event and cooldown path. The existing

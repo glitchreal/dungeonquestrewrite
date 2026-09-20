@@ -782,6 +782,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local revision, tickRevision = 0, 0
     local function current() return isAlive() and revision == tickRevision end
     local function active() return current() and config.Enabled end
+    local function healerRole() return config.Role == "Host" or config.Role == "Alt" end
     local function due(key, seconds, now)
         if now - (times[key] or -math.huge) < seconds then return false end
         times[key] = now
@@ -862,7 +863,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     end
     local function inventoryWork(now)
         if not config.AutoSell then state.sellStatus = "Auto sell: off" end
-        local equipHealer = active() and config.Role == "Alt" and config.AutoHealer
+        local equipHealer = active() and healerRole() and config.AutoHealer
         if not (config.AutoSell or equipHealer) or not due("inventory", state.pendingSale and 2 or 8, now) then return end
         if Adapter.value(player, "busyTrading", false) then
             if config.AutoSell then state.sellStatus = "Auto sell: paused while trading" end
@@ -889,7 +890,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         local protected = {}
         -- Preserve planned tank gear even when only standalone selling is enabled.
-        if config.Role == "Alt" and config.AutoHealer then
+        if healerRole() and config.AutoHealer then
             for _, entry in ipairs(Logic.tankArmor(inv, assert(Adapter.level()))) do
                 protected[entry.kind .. "_" .. entry.id] = true
             end
@@ -900,14 +901,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             local tank = Logic.tankArmor(inv, assert(Adapter.level()))
             for _, entry in ipairs(tank) do
                 protected[entry.kind .. "_" .. entry.id] = true
-                if entry.item.equipped ~= true and active() and config.Role == "Alt" and config.AutoHealer then
+                if entry.item.equipped ~= true and active() and healerRole() and config.AutoHealer then
                     Adapter.call("equipItem", entry.kind, entry.id)
                 end
             end
             local weapon = Logic.mageWeapon(inv, assert(Adapter.level()))
             if weapon then
                 protected["weapon_" .. weapon.id] = true
-                if weapon.item.equipped ~= true and active() and config.Role == "Alt" and config.AutoHealer then
+                if weapon.item.equipped ~= true and active() and healerRole() and config.AutoHealer then
                     Adapter.call("equipItem", "weapon", weapon.id)
                 end
             end
@@ -916,7 +917,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             for _, slot in ipairs({ "q", "e" }) do
                 local heal = desired[slot]
                 if heal then protected["ability_" .. heal.id] = true end
-                if not active() or config.Role ~= "Alt" or not config.AutoHealer then return end
+                if not active() or not healerRole() or not config.AutoHealer then return end
                 if heal and not Logic.slotEquipped(heal.item, slot) then
                     Adapter.call("equipItem", "ability", heal.id, slot)
                 elseif not heal then
@@ -1022,7 +1023,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             save()
         end
         if not active() then return end
-        if config.Role == "Alt" and config.AutoSkillPoints and due("points", 3, now) then
+        if healerRole() and config.AutoSkillPoints and due("points", 3, now) then
             local points = Adapter.value(player, "skillPoints", 0)
             local stat = ({ Stamina = "stamina", ["Spell Power"] = "spellPower", ["Physical Power"] = "physicalPower" })[config.UpgradeStat]
             if points > 0 and stat then Adapter.call("spendSkillPoint", stat, points) end
@@ -1143,8 +1144,8 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         state.farming = config.Role == "Carry" and config.LevelKaitun and canRun
         controller.SetRunning(state.farming)
-        state.status = state.farming and "Carry: pathfinding farm" or config.Role == "Alt" and config.AutoHealer and "Alt: Universal Heal" or "Waiting for carry"
-        if config.Role == "Alt" and config.AutoHealer and healer and canRun then
+        state.status = state.farming and "Carry: pathfinding farm" or healerRole() and config.AutoHealer and (config.Role .. ": Universal Heal") or "Waiting for carry"
+        if healerRole() and config.AutoHealer and healer and canRun then
             -- The slot scheduler alternates Q/E and still respects each tool cooldown.
             -- Stagger heals even when both slots are ready after joining or idling.
             healer.TryCast(now, 4, function(_, snapshot)
@@ -1438,10 +1439,10 @@ local host = roleTab:AddRightGroupbox("2 · Host")
 toggle(host, "AutoBest", "Create and join best eligible dungeon", nil, "Runs when this account is set to Host and role automation is enabled.")
 toggle(host, "AutoAccept", "Accept selected accounts only")
 host:AddLabel("Creates the best dungeon the lowest host/alt can enter, accepts the party, and starts once everyone arrives.", true)
-local alt = roleTab:AddRightGroupbox("3 · Alt")
-toggle(alt, "AutoHealer", "Healer loadout + Universal Heal", nil, "Equips the strongest eligible mage weapon, tank helmet/chest, and up to two Universal Heals. Alternates heals when the party needs health.")
-toggle(alt, "AutoSkillPoints", "Auto allocate skill points")
-dropdown(alt, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
+local support = roleTab:AddRightGroupbox("3 · Host and Alt support")
+toggle(support, "AutoHealer", "Healer loadout + Universal Heal", nil, "On Host or Alt, equips the strongest eligible mage weapon, tank helmet/chest, and up to two Universal Heals. Alternates heals when the party needs health.")
+toggle(support, "AutoSkillPoints", "Auto allocate skill points")
+dropdown(support, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
 local inventory = settingsTab:AddLeftGroupbox("All account types")
 toggle(inventory, "AutoSell", "Auto sell all rarities", nil, "Works without role automation or party setup. Keeps two Universal Heals, equipped/locked/favorite items, and armor selected for the healer loadout.")
 toggle(inventory, "KeepLegendary", "Keep legendary items", nil, "Excludes every legendary weapon, helmet, chest, and ability from Auto Sell. Saved per account; enabled by default.")
