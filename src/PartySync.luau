@@ -79,6 +79,7 @@ function PartySync.new(config, mode, isAlive)
         writeJSON(heartbeatPath(player.UserId), {
             version = 1, userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
             enabled = config.Enabled, ready = config.Enabled and context.ready and now - context.at < 2,
+            healCount = context.healCount,
             at = wallTime(),
         })
     end
@@ -112,11 +113,17 @@ function PartySync.new(config, mode, isAlive)
         return #missing == 0, missing
     end
 
-    function sync.Update(roster, host, carry, ready)
+    local function validMember(member, id, limit)
+        return fresh(member, limit) and member.userId == id and member.mode == mode
+            and member.jobId == game.JobId and member.placeId == game.PlaceId
+    end
+
+    function sync.Update(roster, host, carry, ready, healCount)
         reset()
         local ids = {}
         for _, account in ipairs(roster) do table.insert(ids, account.id) end
-        context = { roster = ids, hostId = host.id, carryId = carry.id, ready = ready, at = os.clock() }
+        context = { roster = ids, hostId = host.id, carryId = carry.id, ready = ready,
+            healCount = tonumber(healCount), at = os.clock() }
         if not files.room then setupRoom(ids, host.id, carry.id) end
     end
     function sync.Pause()
@@ -146,6 +153,27 @@ function PartySync.new(config, mode, isAlive)
                 return command.reason
             end
         end
+    end
+    function sync.HealCounts(roster)
+        reset()
+        local counts = {}
+        if files.room then
+            for _, account in ipairs(roster) do
+                local member = readJSON(heartbeatPath(account.id))
+                if validMember(member, account.id, 3) and type(member.healCount) == "number" then
+                    counts[account.id] = member.healCount
+                end
+            end
+        end
+        if response and receivedAt and os.clock() - receivedAt <= 20 then
+            for _, member in ipairs(response.members) do
+                if member.mode == mode and member.jobId == game.JobId and member.placeId == game.PlaceId
+                    and type(member.healCount) == "number" and counts[member.userId] == nil then
+                    counts[member.userId] = member.healCount
+                end
+            end
+        end
+        return counts
     end
     function sync.Ready(roster)
         reset()
@@ -190,6 +218,7 @@ function PartySync.new(config, mode, isAlive)
                             roster = context.roster, hostId = context.hostId, carryId = context.carryId,
                             userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
                             enabled = config.Enabled, ready = config.Enabled and context.ready and not pending and now - context.at < 5,
+                            healCount = context.healCount,
                             regroup = pending,
                         }
                         local ok, result = pcall(function()

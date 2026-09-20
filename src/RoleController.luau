@@ -50,22 +50,30 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         return true
     end
     local function checkHeals(members, now)
-        local allHealed = true
+        local allHealed, missing = true, {}
+        local synced = sync and sync.HealCounts and sync.HealCounts(roster) or {}
         for _, member in ipairs(members) do
             if member.id ~= carry.id then
                 local key = tostring(member.id)
                 local cached = healCache[key]
-                if member.present and (not cached or now - cached.at >= 20) then
+                local reported = member.id ~= player.UserId and synced[member.id]
+                if type(reported) == "number" then
+                    cached = { at = now, known = true, count = reported }
+                    healCache[key], runtime.Heals[key] = cached, reported
+                elseif member.present and (not cached or now - cached.at >= 5) then
                     local ok, inv = pcall(Adapter.inventory, member.player)
-                    if not active() then return false end
+                    if not active() then return false, {} end
                     cached = { at = now, known = ok, count = ok and #Logic.heals(inv) or 0 }
                     healCache[key] = cached
                     runtime.Heals[key] = ok and cached.count or nil
                 end
-                if not member.present or not cached or not cached.known or cached.count < 2 then allHealed = false end
+                if not member.present or not cached or not cached.known or cached.count < 2 then
+                    allHealed = false
+                    table.insert(missing, member.name .. " " .. (cached and cached.known and cached.count or "?") .. "/2")
+                end
             end
         end
-        return allHealed
+        return allHealed, missing
     end
     local function needsHeals()
         if not config.ProvisionHeals then return false end
@@ -74,8 +82,8 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         return false
     end
-    local function selection(level)
-        local pirate = needsHeals() and Logic.bestDungeon(runtime.Catalog, level, true)
+    local function selection(level, allHealed)
+        local pirate = allHealed ~= true and needsHeals() and Logic.bestDungeon(runtime.Catalog, level, true)
         return pirate or Logic.bestDungeon(runtime.Catalog, level, false)
     end
 
@@ -242,7 +250,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         state.status = "Checking party setup"
         if not configure() then return end
-        if sync then sync.Update(roster, host, carry, true) end
+        if sync then sync.Update(roster, host, carry, true, runtime.Heals[tostring(player.UserId)]) end
         if mode == "Lobby" and not catalogReady then
             state.status = "Loading dungeon requirements"
             local catalog = Adapter.catalog()
@@ -325,13 +333,21 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         elseif Adapter.finished() then state.Finish() end
         if state.finishedAt and now - state.finishedAt >= 5 and not state.rewardsRefreshed then
             healCache = {}; times.inventory = nil; state.rewardsRefreshed = true
+            -- Give every client time to inspect its newly awarded inventory and
+            -- publish the count before the host chooses replay versus progression.
+            if config.ProvisionHeals then state.healsSettlingUntil = now + 2 end
         end
-        local allHealed = config.ProvisionHeals and checkHeals(members, now)
+        local allHealed, healMissing = false, {}
+        if config.ProvisionHeals then allHealed, healMissing = checkHeals(members, now) end
+        if config.ProvisionHeals then
+            state.party = state.party .. (allHealed and " | Universal Heals ready"
+                or " | Heals missing: " .. table.concat(healMissing, ", "))
+        end
         if not active() then return end
         -- Choose for the lowest host/alt level so unequal XP never strands a lower
         -- account in an old dungeon or sends it somewhere it cannot enter.
         local eligibleLevel = partyLevel(members)
-        local chosen = eligibleLevel and selection(eligibleLevel)
+        local chosen = eligibleLevel and selection(eligibleLevel, config.ProvisionHeals and allHealed or nil)
         local current = Adapter.currentDungeon()
         local switchEnabled = config.Role == "Host" and config.AutoBest
             or config.Role ~= "Host" and config.AutoSwitch and not config.SyncEnabled
@@ -341,6 +357,9 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             if state.failed then state.status = "Run failed; waiting for the game to return to lobby"; return end
             -- Let replicated levels and newly awarded drops settle before replay/progression.
             if now - state.finishedAt < 5 then state.status = "Waiting for rewards"; return end
+            if state.healsSettlingUntil and now < state.healsSettlingUntil then
+                state.status = "Syncing Universal Heal rewards"; return
+            end
             if switch then returnLobby("Progression: " .. chosen.Dungeon .. " / " .. chosen.Difficulty, now); return end
             state.status = ready and "Run ended; replaying current dungeon" or "Run ended; waiting for party"
             if config.Role == "Host" and canRun and due("replay", 15, now) and active() then Adapter.replay() end

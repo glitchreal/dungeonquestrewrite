@@ -9,6 +9,7 @@ export function validate(data) {
       || typeof data.jobId !== 'string' || !/^[\w-]{1,100}$/.test(data.jobId)
       || !integer(data.placeId) || !['Lobby', 'Dungeon'].includes(data.mode)
       || typeof data.ready !== 'boolean' || typeof data.enabled !== 'boolean'
+      || (data.healCount !== undefined && (!Number.isInteger(data.healCount) || data.healCount < 0 || data.healCount > 100))
       || (data.regroup !== undefined && (typeof data.regroup !== 'string' || data.regroup.length > 160))) return false;
   return true;
 }
@@ -58,6 +59,7 @@ export class Party {
     this.members.set(data.userId, {
       userId: data.userId, jobId: data.jobId, placeId: data.placeId, mode: data.mode,
       enabled: data.enabled, ready: data.ready, at: now,
+      healCount: data.healCount,
     });
     // Only the configured host announces a regroup. It applies solely to the old
     // dungeon job, so a delayed message cannot eject a newly assembled party.

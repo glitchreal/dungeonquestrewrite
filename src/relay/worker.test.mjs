@@ -13,7 +13,7 @@ test('heartbeats, room inputs, host regroup scope, expiry, and restart', async (
   let now = 100000;
   const originalNow = Date.now; Date.now = () => now;
   const base = { roster: [1, 2, 3], userId: 1, hostId: 1, carryId: 2, jobId: 'old-job',
-    placeId: 85776757589518, mode: 'Dungeon', enabled: true, ready: true };
+    placeId: 85776757589518, mode: 'Dungeon', enabled: true, ready: true, healCount: 2 };
   const post = async overrides => {
     const response = await room.fetch(new Request('https://test/sync', { method: 'POST', body: JSON.stringify({ ...base, ...overrides }) }));
     return { status: response.status, data: await response.json() };
@@ -26,6 +26,7 @@ test('heartbeats, room inputs, host regroup scope, expiry, and restart', async (
     await post({}); await post({ userId: 2 });
     let reply = await post({ userId: 3, ready: false });
     assert.equal(reply.data.members.length, 3);
+    assert.equal(reply.data.members.find(m => m.userId === 1).healCount, 2);
     assert.equal(reply.data.members.find(m => m.userId === 3).ready, false);
     assert.equal((await post({})).status, 429);
     now += 10000;

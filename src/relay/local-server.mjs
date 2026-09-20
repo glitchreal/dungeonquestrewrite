@@ -25,6 +25,7 @@ export class LocalRelay {
     room.members.set(data.userId, {
       userId: data.userId, jobId: data.jobId, placeId: data.placeId, mode: data.mode,
       enabled: data.enabled, ready: data.ready, at: now,
+      healCount: data.healCount,
     });
     if (data.regroup && data.userId === data.hostId && data.mode === 'Dungeon' && data.enabled) {
       room.command = { jobId: data.jobId, reason: data.regroup, expiresAt: now + 30000 };
