@@ -178,6 +178,11 @@ Accounts must share the executor's file workspace to share profiles; the same HW
 alone does not make separate executor folders share files. `autoloadconfig = false`
 starts with defaults and skips shared profiles too.
 
+From Ghastly Harbor through Northern Lands, combat navigation follows each map's
+ordered room checkpoints whenever an enemy is replicated behind walls. Visible
+enemies take priority over stale through-wall target locks, preventing the carry
+from circling adjacent rooms or repeatedly walking into a locked doorway.
+
 Right Shift toggles the Obsidian menu; the key is configurable. Hide UI applies
 on execution. CPU saver disables 3D rendering, caps FPS at 30, and reduces visual
 effects without changing game speed or the combat controller's dodge limits.

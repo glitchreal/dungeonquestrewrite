@@ -8,6 +8,15 @@ local Workspace = game:GetService("Workspace")
 local PathfindingService = game:GetService("PathfindingService")
 
 local player = Players.LocalPlayer
+local ROUTE_GUIDED_DUNGEONS = {
+    ["Ghastly Harbor"] = true,
+    ["Steampunk Sewers"] = true,
+    ["Orbital Outpost"] = true,
+    ["Volcanic Chambers"] = true,
+    ["Aquatic Temple"] = true,
+    ["Enchanted Forest"] = true,
+    ["Northern Lands"] = true,
+}
 
 local CFG = {
     ATTACK_RANGE = 26,
@@ -136,6 +145,9 @@ local state = {
     retreating = false,
     pathComputations = 0,
     threatLog = {},
+    routeDungeon = nil,
+    routeAnchors = {},
+    routeAnchorIndex = 1,
 }
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
@@ -366,6 +378,55 @@ local function getRootPart(model)
     return model.PrimaryPart
 end
 
+local function dungeonName()
+    local value = Workspace:FindFirstChild("dungeonName")
+    return value and value:IsA("ValueBase") and tostring(value.Value) or nil
+end
+
+-- These long, folded maps replicate enemies through walls before their room
+-- opens. Follow the map's own ordered checkpoints instead of aiming directly
+-- through locked doors or at a vertically adjacent room.
+local function refreshRouteAnchors()
+    local name = dungeonName()
+    if state.routeDungeon == name and (#state.routeAnchors > 0 or not ROUTE_GUIDED_DUNGEONS[name]) then return end
+    state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = name, {}, 1
+    if not ROUTE_GUIDED_DUNGEONS[name] then return end
+    local dungeon = Workspace:FindFirstChild("dungeon")
+    if not dungeon then return end
+    for _, instance in ipairs(dungeon:GetDescendants()) do
+        if instance:IsA("BasePart") and instance.Name:lower() == "checkpoint" then
+            local room = instance.Parent and instance.Parent.Name or ""
+            local number = tonumber(room:lower():match("room(%d+)"))
+            local order = number or (room:lower():find("boss", 1, true) and 1000 or 900)
+            table.insert(state.routeAnchors, { part = instance, order = order, name = room })
+        end
+    end
+    table.sort(state.routeAnchors, function(a, b)
+        return a.order < b.order or a.order == b.order and a.name < b.name
+    end)
+end
+
+local function mapRouteGoal(rootPart)
+    refreshRouteAnchors()
+    while true do
+        local anchor = state.routeAnchors[state.routeAnchorIndex]
+        if not anchor then return nil end
+        if not anchor.part.Parent then
+            state.routeDungeon = nil
+            refreshRouteAnchors()
+            anchor = state.routeAnchors[state.routeAnchorIndex]
+            if not anchor then return nil end
+        end
+        local delta = rootPart.Position - anchor.part.Position
+        local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
+        if flat <= 28 and math.abs(delta.Y) <= 60 then
+            state.routeAnchorIndex = state.routeAnchorIndex + 1
+        else
+            return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+        end
+    end
+end
+
 local function isValidTarget(model)
     if not model or not model.Parent or not model:IsA("Model") then return false end
     local humanoid = model:FindFirstChildOfClass("Humanoid")
@@ -422,6 +483,7 @@ local function getClosestEnemy(rootPart, now)
     end
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
     local closest = candidates[1]
+    local closestIsVisible = false
     if closest then
         -- Prefer nearby enemies we can engage over a closer one behind a wall.
         local searchDistance = math.max(CFG.THREAT_RADIUS, closest.distance + 24)
@@ -429,6 +491,7 @@ local function getClosestEnemy(rootPart, now)
             if candidate.distance > searchDistance then break end
             if not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
                 closest = candidate
+                closestIsVisible = true
                 break
             end
         end
@@ -444,7 +507,8 @@ local function getClosestEnemy(rootPart, now)
         local lockedRoot = getRootPart(previousLock)
         if lockedRoot then
             local lockedDist = (rootPart.Position - lockedRoot.Position).Magnitude
-            if lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
+            local lockedVisible = not hasBlockingRay(rootPart.Position, lockedRoot.Position, rootPart.Parent, previousLock)
+            if (not closestIsVisible or lockedVisible) and lockedDist <= pickDist + 20 and lockedDist <= CFG.DETECTION_RADIUS then
                 state.lockedTarget = previousLock
                 return previousLock, lockedDist
             end
@@ -2076,6 +2140,13 @@ local function controllerTick()
         state.navigationPhase = "approach"
         state.lastThreatPart, state.dodgeGoal = nil, nil
         restoreFacing()
+        local routeGoal, routeAnchor = mapRouteGoal(rootPart)
+        if routeGoal and distance > 35 then
+            state.status = "Following " .. tostring(state.routeDungeon) .. " route: " .. routeAnchor.name
+            followGoal(humanoid, rootPart, routeGoal, "map-route", now, target)
+            updateProgress(humanoid, rootPart, routeGoal, target, now)
+            return
+        end
         -- Target on a higher level: the flat navmesh route walks underneath
         -- and never climbs. Chain upward recovery steps toward the target
         -- until the height gap closes. Gated on SUSTAINED elevation so flying
@@ -2318,6 +2389,7 @@ local function setRunning(running)
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
         state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
         state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
+        state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
