@@ -73,6 +73,38 @@ function Geometry.smashExit(zone, position, margin)
     return need, lateral.Unit
 end
 
+-- Return both perpendicular exits from a long, narrow rectangular telegraph.
+-- Generic radial sampling often walks along these attacks and remains inside
+-- the damage lane.  The first result is the nearer edge; the second lets the
+-- planner choose the opposite side when several lanes overlap.
+function Geometry.lineExits(zone, position, margin)
+    if zone.shape ~= "Block" then return nil end
+    local size = zone.size
+    local shortAxis, shortSize, longSize
+    if size.X * 2.25 <= size.Z then
+        shortAxis, shortSize, longSize = "X", size.X, size.Z
+    elseif size.Z * 2.25 <= size.X then
+        shortAxis, shortSize, longSize = "Z", size.Z, size.X
+    else
+        return nil
+    end
+    if longSize < 20 then return nil end
+    local point = zone.frame:PointToObjectSpace(position)
+    local half = size * 0.5
+    if math.abs(point.Y) - half.Y - BASE_MARGIN > 0 then return nil end
+    local coordinate = shortAxis == "X" and point.X or point.Z
+    local needNear = shortSize * 0.5 + (margin or 0) - math.abs(coordinate)
+    if needNear <= 0 or needNear > 45 then return nil end
+    -- Roblox local +Z points opposite CFrame.LookVector.
+    local axis = shortAxis == "X" and zone.frame.RightVector or -zone.frame.LookVector
+    axis = Vector3.new(axis.X, 0, axis.Z)
+    if axis.Magnitude < 0.01 then return nil end
+    axis = axis.Unit
+    if coordinate < 0 then axis = -axis end
+    local needFar = shortSize * 0.5 + (margin or 0) + math.abs(coordinate)
+    return needNear, axis, needFar, -axis
+end
+
 function Geometry.risk(zones, position, margin)
     local risk, nearest = 0, nil
     for _, zone in ipairs(zones) do

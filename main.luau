@@ -1,8 +1,8 @@
--- Public entry point: https://github.com/glitchreal/dungeonquestrewrite
+-- Public entry point: https://github.com/glitchreal/Dungeon-quest
 local env = getgenv()
 if env.autoexecute == nil then env.autoexecute = true end
 if env.autoloadconfig == nil then env.autoloadconfig = true end
-local ROOT = "https://raw.githubusercontent.com/glitchreal/dungeonquestrewrite/main/"
+local ROOT = "https://raw.githubusercontent.com/glitchreal/Dungeon-quest/main/"
 local routes = {
     [77649408247578] = "lobby", -- Main lobby
     [115445507767090] = "lobby", -- Level 100+ lobby
