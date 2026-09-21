@@ -521,7 +521,7 @@ connect(player.OnTeleport, function(teleportState)
     if teleportState ~= Enum.TeleportState.Started then return end
     saveConfig()
     if env.autoexecute == false or teleportQueued or type(queueTeleport) ~= "function" then return end
-    local loaderURL = env.DQObsidianLoaderURL or "https://raw.githubusercontent.com/glitchreal/Dungeon-quest/main/main.luau"
+    local loaderURL = env.DQObsidianLoaderURL or "https://raw.githubusercontent.com/glitchreal/dungeonquestrewrite/main/main.luau"
     local snapshot = HttpService:JSONEncode({ Config = C, Totals = totals, Elapsed = os.clock() - startedAt })
     local queued = string.format("getgenv().autoexecute=true\ngetgenv().autoloadconfig=%s\ngetgenv().DQObsidianResume=game:GetService('HttpService'):JSONDecode(%q)\nassert(loadstring(game:HttpGet(%q)))()", tostring(env.autoloadconfig ~= false), snapshot, loaderURL)
     queueTeleport(queued)
