@@ -36,7 +36,11 @@ local function queueAction(config, now, arrivedAt)
         return "Lobby ready"
     end
     if config.AutoCreate then
-        return Adapter.createLobby(config) and "Lobby created" or "Server declined lobby"
+        local created = Adapter.createLobby(config)
+        if created then
+            return "Lobby created: " .. tostring(config.Dungeon) .. " / " .. tostring(config.Difficulty)
+        end
+        return "Server declined lobby"
     end
     return "Waiting for a lobby"
 end

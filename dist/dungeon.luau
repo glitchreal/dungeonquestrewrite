@@ -137,6 +137,51 @@ function Adapter.dungeonStats(name)
     return result
 end
 
+local function eligibleDifficulties(stats, level)
+    local result = {}
+    for _, difficulty in ipairs({ "Easy", "Medium", "Hard", "Insane", "Nightmare" }) do
+        local entry = stats and stats[difficulty]
+        local required = type(entry) == "table" and tonumber(entry.levelReq)
+        if required and level >= required then
+            table.insert(result, { name = difficulty, levelReq = required })
+        end
+    end
+    return result
+end
+
+-- Saved settings can outlive a level change or an account swap. Resolve them
+-- at queue time so one stale high-level selection cannot stop auto farming.
+function Adapter.resolveLobby(config)
+    local level = Adapter.level()
+    assert(level, "Player level is not loaded")
+    local requestedDungeon = config.Dungeon
+    local requestedOk, requestedStats = pcall(Adapter.dungeonStats, requestedDungeon)
+    local eligible = requestedOk and eligibleDifficulties(requestedStats, level) or {}
+    local dungeon = requestedDungeon
+    if #eligible == 0 then
+        local best, bestScore
+        for _, name in ipairs(Adapter.dungeons()) do
+            local ok, stats = pcall(Adapter.dungeonStats, name)
+            if ok then
+                local available = eligibleDifficulties(stats, level)
+                local highest = available[#available]
+                if highest and (not bestScore or highest.levelReq > bestScore) then
+                    best, bestScore = { name = name, difficulty = highest.name, levelReq = highest.levelReq }, highest.levelReq
+                end
+            end
+        end
+        assert(best, "No dungeon is unlocked at level " .. tostring(level))
+        dungeon, eligible = best.name, { { name = best.difficulty, levelReq = best.levelReq } }
+    end
+    local selected = nil
+    for _, option in ipairs(eligible) do
+        if option.name == config.Difficulty then selected = option end
+    end
+    selected = selected or eligible[#eligible]
+    config.Dungeon, config.Difficulty = dungeon, selected.name
+    return dungeon, selected.name, selected.levelReq
+end
+
 function Adapter.findLobby(raid)
     local games = workspace:FindFirstChild(raid and "bossLobbies" or "games")
     if not games then return nil end
@@ -150,13 +195,9 @@ function Adapter.findLobby(raid)
 end
 
 function Adapter.createLobby(config)
-    local level = Adapter.level()
-    assert(level, "Player level is not loaded")
-    local stats = Adapter.dungeonStats(config.Dungeon)
-    local selected = stats[config.Difficulty]
-    assert(type(selected) == "table" and tonumber(selected.levelReq), "Select an available difficulty")
-    assert(level >= tonumber(selected.levelReq), "This difficulty requires level " .. tostring(selected.levelReq))
-    return Adapter.call("createLobby", config.Dungeon, config.Difficulty, tonumber(selected.levelReq), config.Hardcore and not config.WaveDefence, config.PrivateLobby, config.WaveDefence)
+    local dungeon, difficulty, levelReq = Adapter.resolveLobby(config)
+    return Adapter.call("createLobby", dungeon, difficulty, levelReq,
+        config.Hardcore and not config.WaveDefence, config.PrivateLobby, config.WaveDefence)
 end
 
 function Adapter.replayData()
@@ -3832,7 +3873,14 @@ local function slowTick(now)
     if now - lastQueue >= 5 and (C.AutoCreate or C.AutoStart or C.AutoRaid) and not started and not runEnded then
         lastQueue = now
         job("queue", function()
+            local queuedDungeon, queuedDifficulty = C.Dungeon, C.Difficulty
             local nextLobby, nextRaid = queueAction(C, now, placeStartedAt)
+            if C.Dungeon ~= queuedDungeon and controls.Dungeon then
+                pcall(function() controls.Dungeon:SetValue(C.Dungeon) end)
+            end
+            if C.Difficulty ~= queuedDifficulty and controls.Difficulty then
+                pcall(function() controls.Difficulty:SetValue(C.Difficulty) end)
+            end
             lobbyAction, raidAction = nextLobby or lobbyAction, nextRaid or raidAction
         end)
     end

@@ -639,7 +639,14 @@ local function slowTick(now)
     if now - lastQueue >= 5 and (C.AutoCreate or C.AutoStart or C.AutoRaid) and not started and not runEnded then
         lastQueue = now
         job("queue", function()
+            local queuedDungeon, queuedDifficulty = C.Dungeon, C.Difficulty
             local nextLobby, nextRaid = queueAction(C, now, placeStartedAt)
+            if C.Dungeon ~= queuedDungeon and controls.Dungeon then
+                pcall(function() controls.Dungeon:SetValue(C.Dungeon) end)
+            end
+            if C.Difficulty ~= queuedDifficulty and controls.Difficulty then
+                pcall(function() controls.Difficulty:SetValue(C.Difficulty) end)
+            end
             lobbyAction, raidAction = nextLobby or lobbyAction, nextRaid or raidAction
         end)
     end
