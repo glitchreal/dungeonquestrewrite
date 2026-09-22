@@ -109,14 +109,20 @@ function Adapter.resolveLobby(config)
     return dungeon, selected.name, selected.levelReq
 end
 
-function Adapter.findLobby(raid)
+function Adapter.findLobby(raid, desiredDungeon)
     local games = workspace:FindFirstChild(raid and "bossLobbies" or "games")
     if not games then return nil end
     local list = raid and games or games:FindFirstChild("inLobby")
     if not list then return nil end
     for _, lobby in ipairs(list:GetChildren()) do
         local members = raid and lobby:FindFirstChild("players") or lobby
-        if lobby.Name == player.Name or (members and members:FindFirstChild(player.Name)) then return lobby end
+        if lobby.Name == player.Name or (members and members:FindFirstChild(player.Name)) then
+            if desiredDungeon then
+                local mapName = Adapter.value(lobby, "mapName", nil)
+                if mapName and mapName ~= desiredDungeon then continue end
+            end
+            return lobby
+        end
     end
     return nil
 end

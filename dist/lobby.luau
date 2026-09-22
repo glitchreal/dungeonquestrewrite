@@ -182,14 +182,20 @@ function Adapter.resolveLobby(config)
     return dungeon, selected.name, selected.levelReq
 end
 
-function Adapter.findLobby(raid)
+function Adapter.findLobby(raid, desiredDungeon)
     local games = workspace:FindFirstChild(raid and "bossLobbies" or "games")
     if not games then return nil end
     local list = raid and games or games:FindFirstChild("inLobby")
     if not list then return nil end
     for _, lobby in ipairs(list:GetChildren()) do
         local members = raid and lobby:FindFirstChild("players") or lobby
-        if lobby.Name == player.Name or (members and members:FindFirstChild(player.Name)) then return lobby end
+        if lobby.Name == player.Name or (members and members:FindFirstChild(player.Name)) then
+            if desiredDungeon then
+                local mapName = Adapter.value(lobby, "mapName", nil)
+                if mapName and mapName ~= desiredDungeon then continue end
+            end
+            return lobby
+        end
     end
     return nil
 end
@@ -269,7 +275,12 @@ local function queueAction(config, now, arrivedAt)
         return nil, created and ("Created tier " .. tier) or "Server declined raid lobby"
     end
 
-    local existing = Adapter.findLobby(false)
+    if config.AutoCreate then
+        -- Normalize stale saved settings before deciding whether an existing
+        -- lobby is suitable for this account.
+        Adapter.resolveLobby(config)
+    end
+    local existing = Adapter.findLobby(false, config.AutoCreate and config.Dungeon or nil)
     if existing then
         if config.AutoStart and now - arrivedAt >= config.StartDelay then
             Adapter.call("startDungeon")

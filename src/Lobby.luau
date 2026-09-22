@@ -27,7 +27,12 @@ local function queueAction(config, now, arrivedAt)
         return nil, created and ("Created tier " .. tier) or "Server declined raid lobby"
     end
 
-    local existing = Adapter.findLobby(false)
+    if config.AutoCreate then
+        -- Normalize stale saved settings before deciding whether an existing
+        -- lobby is suitable for this account.
+        Adapter.resolveLobby(config)
+    end
+    local existing = Adapter.findLobby(false, config.AutoCreate and config.Dungeon or nil)
     if existing then
         if config.AutoStart and now - arrivedAt >= config.StartDelay then
             Adapter.call("startDungeon")
