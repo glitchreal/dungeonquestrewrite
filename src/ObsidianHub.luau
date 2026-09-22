@@ -16,7 +16,7 @@ local C = {
     SyncEnabled = false, SyncURL = "", SyncKey = "",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
-    Distance = 20, SpellRange = 26, AutoDodge = true,
+    Distance = 20, SpellRange = 26, AutoDodge = true, AdaptiveCombat = true,
 }
 local defaults = table.clone(C)
 local partyPath = "DungeonQuestRewrite-party.json"
@@ -90,6 +90,7 @@ Library.ScreenGui.Parent = player:WaitForChild("PlayerGui")
 Library.ScreenGui.ResetOnSpawn = false
 Library.Scheme.AccentColor = Color3.fromRGB(63, 205, 134)
 local controller = createController()
+if controller.SetLearningData then controller.SetLearningData(runtime.AdaptiveCombat) end
 local alive, hooks, controls, errors = true, {}, {}, {}
 local coordinator, partySync
 local editingParty = false
@@ -107,6 +108,7 @@ local function snapshot()
     for key, box in pairs(partyInputs) do
         if box.Parent then C[key] = box.Text end
     end
+    if controller.GetLearningData then runtime.AdaptiveCombat = controller.GetLearningData() end
     return { Version = 2, Config = C, Runtime = runtime, MenuKey = menuKey }
 end
 local function save()
@@ -258,6 +260,7 @@ toggle(carry, "LevelKaitun", "Level Kaitun: wait, start, and farm", nil, "Carry 
 slider(carry, "Distance", "Combat distance", 5, 55)
 slider(carry, "SpellRange", "Spell range fallback", 8, 100)
 toggle(carry, "AutoDodge", "Pathfinding hazard avoidance")
+toggle(carry, "AdaptiveCombat", "Adaptive combat policy", nil, "Learns target priority and combat spacing from local health, kill, and damage outcomes. The model stays on this account and falls back to the safe baseline until it has evidence.")
 local join = roleTab:AddLeftGroupbox("Carry and alt")
 toggle(join, "AutoJoin", "Send join requests to host")
 slider(join, "JoinInterval", "Join request interval (seconds)", 5, 60)
@@ -346,6 +349,7 @@ task.spawn(function()
         local cfg = controller.Config
         cfg.COMBAT_DISTANCE, cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = C.Distance, math.max(0, C.Distance - 3), C.Distance + 3
         cfg.SPELL_RANGE_OVERRIDE, cfg.AUTO_DODGE = C.SpellRange, C.AutoDodge
+        cfg.ADAPTIVE_COMBAT = C.AdaptiveCombat
         cfg.AUTO_ABILITIES = C.Role == "Carry"
         local ok, err = xpcall(function()
             if editingParty then

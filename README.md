@@ -183,6 +183,15 @@ ordered room checkpoints whenever an enemy is replicated behind walls. Visible
 enemies take priority over stale through-wall target locks, preventing the carry
 from circling adjacent rooms or repeatedly walking into a locked doorway.
 
+Combat also includes an optional local adaptive policy, enabled by default under
+Carry → Adaptive combat policy. It is a small contextual bandit, not a remote
+black box: it learns whether visible, nearest, clustered, or finishing targets
+and slightly closer/base/far combat spacing produce better health progress with
+less incoming damage. It starts with the existing safe policy, updates only from
+observed kills/health/damage, keeps a bounded model, and saves it in the account's
+existing runtime config. No telemetry or network service is required. Disable the
+toggle to return to the fixed baseline at any time.
+
 Right Shift toggles the Obsidian menu; the key is configurable. Hide UI applies
 on execution. CPU saver disables 3D rendering, caps FPS at 30, and reduces visual
 effects without changing game speed or the combat controller's dodge limits.

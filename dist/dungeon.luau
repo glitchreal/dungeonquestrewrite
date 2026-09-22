@@ -507,6 +507,162 @@ end
 return Abilities
 
 end)()
+local AdaptivePolicy = (function()
+-- Small on-device contextual bandit for decisions that benefit from experience.
+-- This is intentionally bounded and explainable: it learns from local combat
+-- outcomes, never sends telemetry, and falls back to the hand-tuned action until
+-- enough evidence exists to justify changing behavior.
+local AdaptivePolicy = {}
+
+local VERSION = 1
+local MAX_CONTEXTS = 48
+local MAX_ACTIONS = 6
+local MAX_COUNT = 1000000
+local ALPHA = 0.18
+local EXPLORATION = 0.08
+
+local function clamp(value, minimum, maximum)
+    return math.max(minimum, math.min(maximum, value))
+end
+
+local function validKey(value)
+    return type(value) == "string" and #value > 0 and #value <= 80
+end
+
+local function actionList(actions)
+    local result, seen = {}, {}
+    if type(actions) ~= "table" then return result end
+    for _, action in ipairs(actions) do
+        if type(action) == "string" and #action > 0 and #action <= 32 and not seen[action] then
+            seen[action] = true
+            table.insert(result, action)
+            if #result >= MAX_ACTIONS then break end
+        end
+    end
+    return result
+end
+
+local function freshBucket()
+    return { total = 0, actions = {} }
+end
+
+function AdaptivePolicy.new()
+    local self = { version = VERSION, total = 0, contexts = {} }
+
+    local function bucketFor(context, create)
+        if not validKey(context) then return nil end
+        local bucket = self.contexts[context]
+        if not bucket and create then
+            bucket = freshBucket()
+            self.contexts[context] = bucket
+        end
+        return bucket
+    end
+
+    local function prune()
+        local count = 0
+        for _ in pairs(self.contexts) do count = count + 1 end
+        if count <= MAX_CONTEXTS then return end
+        local oldestKey, oldestAt = nil, math.huge
+        for key, bucket in pairs(self.contexts) do
+            local at = tonumber(bucket.lastAt) or 0
+            if at < oldestAt then oldestKey, oldestAt = key, at end
+        end
+        if oldestKey then self.contexts[oldestKey] = nil end
+    end
+
+    function self:choose(context, actions, fallback)
+        local choices = actionList(actions)
+        if #choices == 0 then return fallback end
+        local allowed = {}
+        for _, action in ipairs(choices) do allowed[action] = true end
+        if not allowed[fallback] then fallback = choices[1] end
+        local bucket = bucketFor(context, true)
+        bucket.lastAt = os.clock()
+
+        -- Do not experiment in a fresh context. The controller's baseline has
+        -- been hand-tuned and should win until the model has useful evidence.
+        if (tonumber(bucket.total) or 0) < 3 then return fallback end
+        if math.random() < EXPLORATION then
+            return choices[math.random(1, #choices)]
+        end
+
+        local best, bestScore = fallback, -math.huge
+        for _, action in ipairs(choices) do
+            local sample = bucket.actions[action]
+            local count = sample and tonumber(sample.count) or 0
+            local value = sample and tonumber(sample.value) or 0
+            -- Mild uncertainty bonus lets a new action catch up without
+            -- overpowering a strong, repeatedly observed action.
+            local score = value + 0.24 / math.sqrt(math.max(1, count))
+            if action == fallback then score = score + 0.03 end
+            if score > bestScore then best, bestScore = action, score end
+        end
+        return best
+    end
+
+    function self:observe(context, action, reward)
+        if not validKey(context) or type(action) ~= "string" or #action == 0 then return end
+        local bucket = bucketFor(context, true)
+        local sample = bucket.actions[action]
+        if not sample then sample = { count = 0, value = 0 }; bucket.actions[action] = sample end
+        sample.count = math.min(MAX_COUNT, (tonumber(sample.count) or 0) + 1)
+        sample.value = clamp((tonumber(sample.value) or 0) + ALPHA * (clamp(tonumber(reward) or 0, 0, 1) - (tonumber(sample.value) or 0)), 0, 1)
+        bucket.total = math.min(MAX_COUNT, (tonumber(bucket.total) or 0) + 1)
+        bucket.lastAt = os.clock()
+        self.total = math.min(MAX_COUNT, (tonumber(self.total) or 0) + 1)
+        prune()
+    end
+
+    function self:load(data)
+        if type(data) ~= "table" or tonumber(data.Version) ~= VERSION or type(data.Contexts) ~= "table" then return end
+        self.contexts, self.total = {}, math.max(0, tonumber(data.Total) or 0)
+        local contextCount = 0
+        for context, source in pairs(data.Contexts) do
+            if validKey(context) and type(source) == "table" and type(source.Actions) == "table" then
+                local bucket = freshBucket()
+                bucket.total, bucket.lastAt = math.max(0, tonumber(source.Total) or 0), tonumber(source.LastAt) or 0
+                local actionCount = 0
+                for action, value in pairs(source.Actions) do
+                    if type(action) == "string" and #action <= 32 and type(value) == "table" and actionCount < MAX_ACTIONS then
+                        bucket.actions[action] = {
+                            count = math.min(MAX_COUNT, math.max(0, tonumber(value.Count) or 0)),
+                            value = clamp(tonumber(value.Value) or 0, 0, 1),
+                        }
+                        actionCount = actionCount + 1
+                    end
+                end
+                self.contexts[context] = bucket
+                contextCount = contextCount + 1
+                if contextCount >= MAX_CONTEXTS then break end
+            end
+        end
+    end
+
+    function self:export()
+        local result = { Version = VERSION, Total = self.total, Contexts = {} }
+        for context, bucket in pairs(self.contexts) do
+            local output = { Total = bucket.total or 0, LastAt = bucket.lastAt or 0, Actions = {} }
+            for action, sample in pairs(bucket.actions or {}) do
+                output.Actions[action] = { Count = sample.count or 0, Value = sample.value or 0 }
+            end
+            result.Contexts[context] = output
+        end
+        return result
+    end
+
+    function self:summary()
+        local contexts = 0
+        for _ in pairs(self.contexts) do contexts = contexts + 1 end
+        return { observations = self.total, contexts = contexts }
+    end
+
+    return self
+end
+
+return AdaptivePolicy
+
+end)()
 local PartySync = (function()
 -- Same-workspace files are the fastest sync path and need no background process.
 -- The HTTP relay remains a fallback when executor instances isolate their files.
@@ -1435,6 +1591,7 @@ local CFG = {
     RETREAT_RELEASE_MARGIN = 5,
     FARM_POSITION = "Nearest",
     SMART_FARM = true,
+    ADAPTIVE_COMBAT = true,
     GROUP_RADIUS = 6,
     CLOSE_AOE_RANGE = 8,
     SPELL_RANGE_OVERRIDE = 0,
@@ -1519,7 +1676,11 @@ local state = {
     routeDungeon = nil,
     routeAnchors = {},
     routeAnchorIndex = 1,
+    adaptiveTarget = nil,
+    targetStrategy = "visible",
 }
+
+local adaptive = AdaptivePolicy.new()
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
 -- Lets a later hit be explained from the previous ~60s of decisions.
@@ -1813,6 +1974,21 @@ local function isPlayerOrLobbyCharacter(model)
     return false
 end
 
+local TARGET_STRATEGIES = { "visible", "nearest", "cluster", "finish" }
+local RANGE_ACTIONS = { "close", "base", "far" }
+
+local function adaptiveTargetContext()
+    return "target|" .. tostring(game.PlaceId)
+end
+
+local function targetScore(candidate, strategy)
+    local blocked = candidate.visible and 0 or 1000
+    if strategy == "nearest" then return candidate.distance + blocked * 0.25 end
+    if strategy == "cluster" then return candidate.distance + blocked - candidate.cluster * 9 end
+    if strategy == "finish" then return candidate.distance + blocked + candidate.healthRatio * 70 end
+    return candidate.distance + blocked
+end
+
 local function refreshTargets(rootPart, now)
     if now - state.lastTargetScan < CFG.TARGET_SCAN_INTERVAL then return end
     state.lastTargetScan = now
@@ -1852,21 +2028,40 @@ local function getClosestEnemy(rootPart, now)
             end
         end
     end
+    -- Keep the adaptive scan bounded. The old controller only considered the
+    -- nearest engagement ring, and doing the same here avoids raycasting every
+    -- replicated enemy on large waves while retaining enough context for AoE.
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
-    local closest = candidates[1]
-    local closestIsVisible = false
-    if closest then
-        -- Prefer nearby enemies we can engage over a closer one behind a wall.
-        local searchDistance = math.max(CFG.THREAT_RADIUS, closest.distance + 24)
-        for _, candidate in ipairs(candidates) do
-            if candidate.distance > searchDistance then break end
-            if not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
-                closest = candidate
-                closestIsVisible = true
-                break
+    local searchDistance = candidates[1] and math.max(CFG.THREAT_RADIUS, candidates[1].distance + 24) or 0
+    local shortlist = {}
+    for index, candidate in ipairs(candidates) do
+        if index > 24 or candidate.distance > searchDistance then break end
+        table.insert(shortlist, candidate)
+    end
+    candidates = shortlist
+    local strategy = CFG.ADAPTIVE_COMBAT and adaptive:choose(adaptiveTargetContext(), TARGET_STRATEGIES, "visible") or "visible"
+    state.targetStrategy = strategy
+    for _, candidate in ipairs(candidates) do
+        candidate.visible = not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model)
+        local humanoid = candidate.model:FindFirstChildOfClass("Humanoid")
+        candidate.healthRatio = humanoid and math.clamp(humanoid.Health / math.max(1, humanoid.MaxHealth), 0, 1) or 1
+    end
+    for _, candidate in ipairs(candidates) do
+        local cluster = 0
+        for _, other in ipairs(candidates) do
+            if other ~= candidate and (other.root.Position - candidate.root.Position).Magnitude <= CFG.GROUP_RADIUS then
+                cluster = cluster + 1
             end
         end
+        candidate.cluster = cluster
+        candidate.score = targetScore(candidate, strategy)
     end
+    table.sort(candidates, function(a, b)
+        if a.score == b.score then return a.distance < b.distance end
+        return a.score < b.score
+    end)
+    local closest = candidates[1]
+    local closestIsVisible = closest and closest.visible or false
     local previousLock = state.lockedTarget
     state.lockedTarget = closest and closest.model
     local pickDist = closest and closest.distance or CFG.DETECTION_RADIUS
@@ -1886,6 +2081,50 @@ local function getClosestEnemy(rootPart, now)
         end
     end
     return state.lockedTarget, pickDist
+end
+
+local function adaptiveCombatDistance(target)
+    local base = CFG.COMBAT_DISTANCE
+    local entry = state.adaptiveTarget
+    if not CFG.ADAPTIVE_COMBAT or not entry or entry.target ~= target then return base end
+    local offset = ({ close = -3, base = 0, far = 4 })[entry.rangeAction] or 0
+    return math.clamp(base + offset, math.max(5, base - 3), math.min(55, base + 4))
+end
+
+local function finishAdaptiveTarget(now, terminal)
+    local entry = state.adaptiveTarget
+    if not entry or not CFG.ADAPTIVE_COMBAT then state.adaptiveTarget = nil; return end
+    local startingHealth = math.max(1, entry.startHealth or 1)
+    local currentHealth = terminal and 0 or math.max(0, entry.lastHealth or startingHealth)
+    local progress = math.clamp((startingHealth - currentHealth) / startingHealth, 0, 1)
+    local damageTaken = math.max(0, state.damageEvents - (entry.startDamage or state.damageEvents))
+    local reward = 0.15 + progress * 0.65 + (terminal and 0.3 or 0) - math.min(0.25, damageTaken * 0.05)
+    if now - (entry.startedAt or now) < 1.25 then reward = reward * 0.5 end
+    adaptive:observe(entry.targetContext, entry.targetAction, reward)
+    adaptive:observe(entry.rangeContext, entry.rangeAction, reward)
+    state.adaptiveTarget = nil
+end
+
+local function beginAdaptiveTarget(target, humanoid, now)
+    if not CFG.ADAPTIVE_COMBAT then return end
+    if state.adaptiveTarget and state.adaptiveTarget.target == target then
+        state.adaptiveTarget.lastHealth = humanoid.Health
+        return
+    end
+    if state.adaptiveTarget then finishAdaptiveTarget(now, false) end
+    local kind = target.Name == "Ancient Temple Protector" and "boss" or "mob"
+    local rangeContext = "range|" .. tostring(game.PlaceId) .. "|" .. kind
+    state.adaptiveTarget = {
+        target = target,
+        targetContext = adaptiveTargetContext() .. "|" .. kind,
+        targetAction = state.targetStrategy or "visible",
+        rangeContext = rangeContext,
+        rangeAction = adaptive:choose(rangeContext, RANGE_ACTIONS, "base"),
+        startHealth = humanoid.Health,
+        lastHealth = humanoid.Health,
+        startDamage = state.damageEvents,
+        startedAt = now,
+    }
 end
 
 local function buildRaycastParams(character, target)
@@ -2731,7 +2970,8 @@ local function findEscapeGoal(rootPart, targetRoot)
                 if backOk and (originalRisk == 0 or risk < originalRisk - 0.1)
                     and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
-                    local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
+                    local desiredDistance = adaptiveCombatDistance(targetRoot.Parent)
+                        + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
                     local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
                         - radius * 2 - math.abs(targetDistance - desiredDistance)
                         - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
@@ -3433,6 +3673,7 @@ local function controllerTick()
     end
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
+        finishAdaptiveTarget(now, state.adaptiveTarget and not isValidTarget(state.adaptiveTarget.target) or false)
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.lastThreatPart = nil, nil
@@ -3459,9 +3700,11 @@ local function controllerTick()
 
     local targetHumanoid, targetRoot = target:FindFirstChildOfClass("Humanoid"), getRootPart(target)
     if not targetHumanoid or targetHumanoid.Health <= 0 or not targetRoot then
+        finishAdaptiveTarget(now, true)
         state.lockedTarget = nil
         return
     end
+    beginAdaptiveTarget(target, targetHumanoid, now)
     if state.currentTarget ~= target then
         local previousRoot = state.currentTarget and getRootPart(state.currentTarget)
         if not previousRoot or (previousRoot.Position - targetRoot.Position).Magnitude > 4 then
@@ -3474,6 +3717,7 @@ local function controllerTick()
         state.wallVisits, state.wallFlips = {}, 0
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
+    if state.adaptiveTarget then state.adaptiveTarget.lastHealth = targetHumanoid.Health end
     -- Doomed round: same target for 3 minutes with zero kills and zero damage
     -- dealt (e.g. mob under the map behind a wall that never opens). Solo
     -- only, so nobody else's run is ever touched. Leaves via teleToLobby.
@@ -3675,7 +3919,7 @@ local function controllerTick()
         local flat = Vector3.new(offset.X, 0, offset.Z)
         if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
         local tangent = Vector3.new(-flat.Z, 0, flat.X).Unit * state.dodgeSide * 4
-        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE + tangent, character, target)
+        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * adaptiveCombatDistance(target) + tangent, character, target)
         if (desiredPosition - rootPart.Position).Magnitude > 1 then
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
         end
@@ -3699,7 +3943,7 @@ local function controllerTick()
             flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi / 6):VectorToWorldSpace(radial)
         end
     end
-    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * adaptiveCombatDistance(target), character, target)
     -- Idle creep (Protector): with no active threats, blink small steps
     -- toward the hold instead of only walking. Closes distance between
     -- volleys so the fight happens at sidestep range, not cross-arena.
@@ -3780,6 +4024,7 @@ local function setRunning(running)
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
+        state.adaptiveTarget, state.targetStrategy = nil, "visible"
         createWaypointFolder()
         state.pathStatus = "Pathfinding: active"
     else
@@ -3870,6 +4115,7 @@ connect(player.CharacterAdded, function(character)
     state.motionGoal, state.motionGoalMode, state.motionMode = nil, nil, "idle"
     state.fallbackGoal, state.fallbackUntil = nil, 0
     state.lastPlayerHealth, state.lastTargetScan = nil, 0
+    state.adaptiveTarget = nil
     state.pathUpdateTime = 0
     state.stuckStartTime, state.stuckCount = 0, 0
     state.dodgeGoal = nil
@@ -3889,6 +4135,9 @@ return {
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetAbilityInventory = abilities.SetInventory,
     AbilityProfile = FarmPlanner.profile,
+    SetLearningData = function(data) adaptive:load(data) end,
+    GetLearningData = function() return adaptive:export() end,
+    AdaptiveStatus = function() return adaptive:summary() end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end
@@ -3916,7 +4165,7 @@ local C = {
     SyncEnabled = false, SyncURL = "", SyncKey = "",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
-    Distance = 20, SpellRange = 26, AutoDodge = true,
+    Distance = 20, SpellRange = 26, AutoDodge = true, AdaptiveCombat = true,
 }
 local defaults = table.clone(C)
 local partyPath = "DungeonQuestRewrite-party.json"
@@ -3990,6 +4239,7 @@ Library.ScreenGui.Parent = player:WaitForChild("PlayerGui")
 Library.ScreenGui.ResetOnSpawn = false
 Library.Scheme.AccentColor = Color3.fromRGB(63, 205, 134)
 local controller = createController()
+if controller.SetLearningData then controller.SetLearningData(runtime.AdaptiveCombat) end
 local alive, hooks, controls, errors = true, {}, {}, {}
 local coordinator, partySync
 local editingParty = false
@@ -4007,6 +4257,7 @@ local function snapshot()
     for key, box in pairs(partyInputs) do
         if box.Parent then C[key] = box.Text end
     end
+    if controller.GetLearningData then runtime.AdaptiveCombat = controller.GetLearningData() end
     return { Version = 2, Config = C, Runtime = runtime, MenuKey = menuKey }
 end
 local function save()
@@ -4158,6 +4409,7 @@ toggle(carry, "LevelKaitun", "Level Kaitun: wait, start, and farm", nil, "Carry 
 slider(carry, "Distance", "Combat distance", 5, 55)
 slider(carry, "SpellRange", "Spell range fallback", 8, 100)
 toggle(carry, "AutoDodge", "Pathfinding hazard avoidance")
+toggle(carry, "AdaptiveCombat", "Adaptive combat policy", nil, "Learns target priority and combat spacing from local health, kill, and damage outcomes. The model stays on this account and falls back to the safe baseline until it has evidence.")
 local join = roleTab:AddLeftGroupbox("Carry and alt")
 toggle(join, "AutoJoin", "Send join requests to host")
 slider(join, "JoinInterval", "Join request interval (seconds)", 5, 60)
@@ -4246,6 +4498,7 @@ task.spawn(function()
         local cfg = controller.Config
         cfg.COMBAT_DISTANCE, cfg.COMBAT_MIN_DISTANCE, cfg.COMBAT_MAX_DISTANCE = C.Distance, math.max(0, C.Distance - 3), C.Distance + 3
         cfg.SPELL_RANGE_OVERRIDE, cfg.AUTO_DODGE = C.SpellRange, C.AutoDodge
+        cfg.ADAPTIVE_COMBAT = C.AdaptiveCombat
         cfg.AUTO_ABILITIES = C.Role == "Carry"
         local ok, err = xpcall(function()
             if editingParty then

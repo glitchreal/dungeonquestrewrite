@@ -66,6 +66,7 @@ local CFG = {
     RETREAT_RELEASE_MARGIN = 5,
     FARM_POSITION = "Nearest",
     SMART_FARM = true,
+    ADAPTIVE_COMBAT = true,
     GROUP_RADIUS = 6,
     CLOSE_AOE_RANGE = 8,
     SPELL_RANGE_OVERRIDE = 0,
@@ -150,7 +151,11 @@ local state = {
     routeDungeon = nil,
     routeAnchors = {},
     routeAnchorIndex = 1,
+    adaptiveTarget = nil,
+    targetStrategy = "visible",
 }
+
+local adaptive = AdaptivePolicy.new()
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
 -- Lets a later hit be explained from the previous ~60s of decisions.
@@ -444,6 +449,21 @@ local function isPlayerOrLobbyCharacter(model)
     return false
 end
 
+local TARGET_STRATEGIES = { "visible", "nearest", "cluster", "finish" }
+local RANGE_ACTIONS = { "close", "base", "far" }
+
+local function adaptiveTargetContext()
+    return "target|" .. tostring(game.PlaceId)
+end
+
+local function targetScore(candidate, strategy)
+    local blocked = candidate.visible and 0 or 1000
+    if strategy == "nearest" then return candidate.distance + blocked * 0.25 end
+    if strategy == "cluster" then return candidate.distance + blocked - candidate.cluster * 9 end
+    if strategy == "finish" then return candidate.distance + blocked + candidate.healthRatio * 70 end
+    return candidate.distance + blocked
+end
+
 local function refreshTargets(rootPart, now)
     if now - state.lastTargetScan < CFG.TARGET_SCAN_INTERVAL then return end
     state.lastTargetScan = now
@@ -483,21 +503,40 @@ local function getClosestEnemy(rootPart, now)
             end
         end
     end
+    -- Keep the adaptive scan bounded. The old controller only considered the
+    -- nearest engagement ring, and doing the same here avoids raycasting every
+    -- replicated enemy on large waves while retaining enough context for AoE.
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
-    local closest = candidates[1]
-    local closestIsVisible = false
-    if closest then
-        -- Prefer nearby enemies we can engage over a closer one behind a wall.
-        local searchDistance = math.max(CFG.THREAT_RADIUS, closest.distance + 24)
-        for _, candidate in ipairs(candidates) do
-            if candidate.distance > searchDistance then break end
-            if not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model) then
-                closest = candidate
-                closestIsVisible = true
-                break
+    local searchDistance = candidates[1] and math.max(CFG.THREAT_RADIUS, candidates[1].distance + 24) or 0
+    local shortlist = {}
+    for index, candidate in ipairs(candidates) do
+        if index > 24 or candidate.distance > searchDistance then break end
+        table.insert(shortlist, candidate)
+    end
+    candidates = shortlist
+    local strategy = CFG.ADAPTIVE_COMBAT and adaptive:choose(adaptiveTargetContext(), TARGET_STRATEGIES, "visible") or "visible"
+    state.targetStrategy = strategy
+    for _, candidate in ipairs(candidates) do
+        candidate.visible = not hasBlockingRay(rootPart.Position, candidate.root.Position, rootPart.Parent, candidate.model)
+        local humanoid = candidate.model:FindFirstChildOfClass("Humanoid")
+        candidate.healthRatio = humanoid and math.clamp(humanoid.Health / math.max(1, humanoid.MaxHealth), 0, 1) or 1
+    end
+    for _, candidate in ipairs(candidates) do
+        local cluster = 0
+        for _, other in ipairs(candidates) do
+            if other ~= candidate and (other.root.Position - candidate.root.Position).Magnitude <= CFG.GROUP_RADIUS then
+                cluster = cluster + 1
             end
         end
+        candidate.cluster = cluster
+        candidate.score = targetScore(candidate, strategy)
     end
+    table.sort(candidates, function(a, b)
+        if a.score == b.score then return a.distance < b.distance end
+        return a.score < b.score
+    end)
+    local closest = candidates[1]
+    local closestIsVisible = closest and closest.visible or false
     local previousLock = state.lockedTarget
     state.lockedTarget = closest and closest.model
     local pickDist = closest and closest.distance or CFG.DETECTION_RADIUS
@@ -517,6 +556,50 @@ local function getClosestEnemy(rootPart, now)
         end
     end
     return state.lockedTarget, pickDist
+end
+
+local function adaptiveCombatDistance(target)
+    local base = CFG.COMBAT_DISTANCE
+    local entry = state.adaptiveTarget
+    if not CFG.ADAPTIVE_COMBAT or not entry or entry.target ~= target then return base end
+    local offset = ({ close = -3, base = 0, far = 4 })[entry.rangeAction] or 0
+    return math.clamp(base + offset, math.max(5, base - 3), math.min(55, base + 4))
+end
+
+local function finishAdaptiveTarget(now, terminal)
+    local entry = state.adaptiveTarget
+    if not entry or not CFG.ADAPTIVE_COMBAT then state.adaptiveTarget = nil; return end
+    local startingHealth = math.max(1, entry.startHealth or 1)
+    local currentHealth = terminal and 0 or math.max(0, entry.lastHealth or startingHealth)
+    local progress = math.clamp((startingHealth - currentHealth) / startingHealth, 0, 1)
+    local damageTaken = math.max(0, state.damageEvents - (entry.startDamage or state.damageEvents))
+    local reward = 0.15 + progress * 0.65 + (terminal and 0.3 or 0) - math.min(0.25, damageTaken * 0.05)
+    if now - (entry.startedAt or now) < 1.25 then reward = reward * 0.5 end
+    adaptive:observe(entry.targetContext, entry.targetAction, reward)
+    adaptive:observe(entry.rangeContext, entry.rangeAction, reward)
+    state.adaptiveTarget = nil
+end
+
+local function beginAdaptiveTarget(target, humanoid, now)
+    if not CFG.ADAPTIVE_COMBAT then return end
+    if state.adaptiveTarget and state.adaptiveTarget.target == target then
+        state.adaptiveTarget.lastHealth = humanoid.Health
+        return
+    end
+    if state.adaptiveTarget then finishAdaptiveTarget(now, false) end
+    local kind = target.Name == "Ancient Temple Protector" and "boss" or "mob"
+    local rangeContext = "range|" .. tostring(game.PlaceId) .. "|" .. kind
+    state.adaptiveTarget = {
+        target = target,
+        targetContext = adaptiveTargetContext() .. "|" .. kind,
+        targetAction = state.targetStrategy or "visible",
+        rangeContext = rangeContext,
+        rangeAction = adaptive:choose(rangeContext, RANGE_ACTIONS, "base"),
+        startHealth = humanoid.Health,
+        lastHealth = humanoid.Health,
+        startDamage = state.damageEvents,
+        startedAt = now,
+    }
 end
 
 local function buildRaycastParams(character, target)
@@ -1362,7 +1445,8 @@ local function findEscapeGoal(rootPart, targetRoot)
                 if backOk and (originalRisk == 0 or risk < originalRisk - 0.1)
                     and ((originalCrowd >= crowdLimit and not state.retreating) or crowd > originalCrowd + 0.25) then
                     local targetDistance = (candidate - targetRoot.Position).Magnitude
-                    local desiredDistance = CFG.COMBAT_DISTANCE + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
+                    local desiredDistance = adaptiveCombatDistance(targetRoot.Parent)
+                        + (state.retreating and CFG.RETREAT_RELEASE_MARGIN or 0)
                     local score = -risk * 1000 + math.min(hazardClearance, 12) + math.min(crowd, 28)
                         - radius * 2 - math.abs(targetDistance - desiredDistance)
                         - math.max(0, targetDistance - CFG.ATTACK_RANGE) * 4
@@ -2064,6 +2148,7 @@ local function controllerTick()
     end
     local target, distance = getClosestEnemy(rootPart, now)
     if not target then
+        finishAdaptiveTarget(now, state.adaptiveTarget and not isValidTarget(state.adaptiveTarget.target) or false)
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
         state.retreating = false
         state.escapeGoal, state.lastThreatPart = nil, nil
@@ -2090,9 +2175,11 @@ local function controllerTick()
 
     local targetHumanoid, targetRoot = target:FindFirstChildOfClass("Humanoid"), getRootPart(target)
     if not targetHumanoid or targetHumanoid.Health <= 0 or not targetRoot then
+        finishAdaptiveTarget(now, true)
         state.lockedTarget = nil
         return
     end
+    beginAdaptiveTarget(target, targetHumanoid, now)
     if state.currentTarget ~= target then
         local previousRoot = state.currentTarget and getRootPart(state.currentTarget)
         if not previousRoot or (previousRoot.Position - targetRoot.Position).Magnitude > 4 then
@@ -2105,6 +2192,7 @@ local function controllerTick()
         state.wallVisits, state.wallFlips = {}, 0
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
+    if state.adaptiveTarget then state.adaptiveTarget.lastHealth = targetHumanoid.Health end
     -- Doomed round: same target for 3 minutes with zero kills and zero damage
     -- dealt (e.g. mob under the map behind a wall that never opens). Solo
     -- only, so nobody else's run is ever touched. Leaves via teleToLobby.
@@ -2306,7 +2394,7 @@ local function controllerTick()
         local flat = Vector3.new(offset.X, 0, offset.Z)
         if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) end
         local tangent = Vector3.new(-flat.Z, 0, flat.X).Unit * state.dodgeSide * 4
-        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE + tangent, character, target)
+        local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * adaptiveCombatDistance(target) + tangent, character, target)
         if (desiredPosition - rootPart.Position).Magnitude > 1 then
             followGoal(humanoid, rootPart, desiredPosition, "combat", now, target)
         end
@@ -2330,7 +2418,7 @@ local function controllerTick()
             flat = CFrame.fromAxisAngle(Vector3.yAxis, state.protectorOrbitSide * math.pi / 6):VectorToWorldSpace(radial)
         end
     end
-    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * CFG.COMBAT_DISTANCE, character, target)
+    local desiredPosition = groundPosition(targetRoot.Position + flat.Unit * adaptiveCombatDistance(target), character, target)
     -- Idle creep (Protector): with no active threats, blink small steps
     -- toward the hold instead of only walking. Closes distance between
     -- volleys so the fight happens at sidestep range, not cross-arena.
@@ -2411,6 +2499,7 @@ local function setRunning(running)
         state.doomWatch, state.doomFired = nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
+        state.adaptiveTarget, state.targetStrategy = nil, "visible"
         createWaypointFolder()
         state.pathStatus = "Pathfinding: active"
     else
@@ -2501,6 +2590,7 @@ connect(player.CharacterAdded, function(character)
     state.motionGoal, state.motionGoalMode, state.motionMode = nil, nil, "idle"
     state.fallbackGoal, state.fallbackUntil = nil, 0
     state.lastPlayerHealth, state.lastTargetScan = nil, 0
+    state.adaptiveTarget = nil
     state.pathUpdateTime = 0
     state.stuckStartTime, state.stuckCount = 0, 0
     state.dodgeGoal = nil
@@ -2520,6 +2610,9 @@ return {
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetAbilityInventory = abilities.SetInventory,
     AbilityProfile = FarmPlanner.profile,
+    SetLearningData = function(data) adaptive:load(data) end,
+    GetLearningData = function() return adaptive:export() end,
+    AdaptiveStatus = function() return adaptive:summary() end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end
