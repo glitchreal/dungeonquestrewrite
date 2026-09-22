@@ -1398,10 +1398,12 @@ local CFG = {
     THREAT_SCAN_INTERVAL = 0.2,
     DETECTION_RADIUS = 1000,
 
-    PATH_UPDATE_INTERVAL = 0.8,
+    -- Repath often enough to follow moving targets and opened doors, while
+    -- the failed-path cache still prevents repeated identical computations.
+    PATH_UPDATE_INTERVAL = 0.55,
     WAYPOINT_REACH_THRESHOLD = 3,
     DIRECT_PATH_DISTANCE = 40,
-    MOVETO_REFRESH_INTERVAL = 0.45,
+    MOVETO_REFRESH_INTERVAL = 0.35,
     AGENT_RADIUS = 2.0,
     AGENT_HEIGHT = 5.5,
     AGENT_CAN_JUMP = true,
@@ -2199,7 +2201,11 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if state.terrainRecovery and #state.waypoints > 0 then
         goal, mode = state.terrainRecovery, "terrain-recovery"
     end
-    local newGoal = not state.motionGoal or (state.motionGoal - goal).Magnitude > 2 or state.motionGoalMode ~= mode
+    -- Combat targets move every frame. Replacing the goal for tiny changes
+    -- resets progress bookkeeping and makes pursuit look hesitant; route and
+    -- recovery goals keep the tighter threshold for accurate stair traversal.
+    local goalThreshold = mode == "combat" and 4 or 2
+    local newGoal = not state.motionGoal or (state.motionGoal - goal).Magnitude > goalThreshold or state.motionGoalMode ~= mode
     if newGoal then
         state.motionGoal, state.motionGoalMode = goal, mode
         state.fallbackGoal, state.fallbackUntil = nil, 0
