@@ -1740,15 +1740,16 @@ local function dodgeAlongEscape(humanoid, rootPart, goal, target, threat, now, f
     local delta = goal - rootPart.Position
     if delta.Magnitude < 0.5 then return end
     local step = rootPart.Position + delta.Unit * math.min(CFG.DODGE_LATERAL_DISTANCE, delta.Magnitude)
-    if enemyClearance(step) <= enemyClearance(rootPart.Position) and typeof(threat) == "Instance" and threat:IsA("Model") then return end
+    if not forceBlink and enemyClearance(step) <= enemyClearance(rootPart.Position)
+        and typeof(threat) == "Instance" and threat:IsA("Model") then return end
     -- Teleport budget is reserved for telegraphed attacks (zone parts and
     -- announcements). Melee separation walks: spending the 3-per-3s budget
     -- dodging bodies leaves nothing for the one-shot windup that follows.
     local telegraphed = not (typeof(threat) == "Instance" and threat:IsA("Model"))
-    -- Walk small dodges, blink far ones: anything inside half a second of
-    -- walking is smoother on foot; the blink is for real distance.
-    -- Emergencies (least-bad) and intentional bursts (windup) always blink.
-    if telegraphed and CFG.TELEPORT_DODGE and (forceBlink or delta.Magnitude > 12) then
+    -- Walk ordinary corrections, but blink out of confirmed body contact.
+    -- Waiting to walk a melee escape costs several frames of health and is
+    -- what previously produced repeated hits while the status stayed evasive.
+    if CFG.TELEPORT_DODGE and (forceBlink or telegraphed and delta.Magnitude > 12) then
         performDodgeTeleport(humanoid, rootPart, step, target, threat, now)
     end
 end
@@ -1853,7 +1854,7 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
             state.escapeClear, state.lastEscapeCheck = true, now
             state.escapeReason = "Breaking melee contact"
             state.status = state.escapeReason
-            dodgeAlongEscape(humanoid, rootPart, separation, target, contactThreat, now)
+            dodgeAlongEscape(humanoid, rootPart, separation, target, contactThreat, now, true)
             issueMove(humanoid, separation, "evade", now)
             return true
         end
