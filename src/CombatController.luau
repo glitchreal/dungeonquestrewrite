@@ -1838,7 +1838,14 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
     local contactDistance = (targetRoot.Position - rootPart.Position).Magnitude
-    if contactThreat and (contactThreat == target or contactDistance <= CFG.MELEE_DANGER_DISTANCE) then
+    -- Once a melee escape is validated, keep that short goal for its lease.
+    -- Replanning while the same enemy is still touching the body used to
+    -- clear the path every tick and caused rapid retreat-direction flips.
+    local meleeEscapeActive = state.escapeReason == "Breaking melee contact"
+        and state.escapeGoal and now < (state.escapeUntil or 0)
+        and (state.escapeGoal - rootPart.Position).Magnitude > 2
+    if contactThreat and not meleeEscapeActive
+        and (contactThreat == target or contactDistance <= CFG.MELEE_DANGER_DISTANCE) then
         local separation = nil
         if isProt then
             separation = protectorLateralSeparation(rootPart, targetRoot, target)
