@@ -1,30 +1,148 @@
+-- Pure decisions shared by the role coordinator and focused policy checks.
 local Logic = {}
 Logic.Difficulties = { "Easy", "Medium", "Hard", "Insane", "Nightmare" }
+-- These seasonal entries currently lack reliable event flags in getDungeonStats.
+local seasonal = { ["Egg Island"] = true, Krampus = true, ["Tutorial Dungeon"] = true }
 
-function Logic.eligibleDifficulties(stats, level)
-    local values = {}
-    for _, name in ipairs(Logic.Difficulties) do
-        local entry = stats and stats[name]
-        local required = type(entry) == "table" and tonumber(entry.levelReq)
-        if required and level and level >= required then table.insert(values, name) end
+-- Dungeon clients cannot open the lobby catalog UI. Keep the normal progression
+-- requirements here as a fallback, then let live getDungeonStats data override it
+-- whenever the host visits a lobby. This also lets old saved catalogs learn new maps.
+local requirements = {
+    ["Desert Temple"] = { Easy = 1, Medium = 6, Hard = 12, Insane = 20, Nightmare = 27 },
+    ["Winter Outpost"] = { Easy = 33, Medium = 40, Hard = 45, Insane = 50, Nightmare = 55 },
+    ["Pirate Island"] = { Insane = 60, Nightmare = 65 },
+    ["King's Castle"] = { Insane = 70, Nightmare = 75 },
+    ["The Underworld"] = { Insane = 80, Nightmare = 85 },
+    ["Samurai Palace"] = { Insane = 90, Nightmare = 95 },
+    ["The Canals"] = { Insane = 100, Nightmare = 105 },
+    ["Ghastly Harbor"] = { Insane = 110, Nightmare = 115 },
+    ["Steampunk Sewers"] = { Insane = 120, Nightmare = 125 },
+    ["Orbital Outpost"] = { Insane = 140, Nightmare = 145 },
+    ["Volcanic Chambers"] = { Insane = 150, Nightmare = 155 },
+    ["Aquatic Temple"] = { Insane = 160, Nightmare = 165 },
+    ["Enchanted Forest"] = { Insane = 170, Nightmare = 175 },
+    ["Northern Lands"] = { Insane = 180, Nightmare = 185 },
+}
+
+function Logic.catalog(live)
+    local result = {}
+    for dungeon, difficulties in pairs(requirements) do
+        result[dungeon] = {}
+        for difficulty, levelReq in pairs(difficulties) do
+            result[dungeon][difficulty] = { levelReq = levelReq }
+        end
     end
-    return values
+    for dungeon, difficulties in pairs(type(live) == "table" and live or {}) do
+        result[dungeon] = result[dungeon] or {}
+        for difficulty, data in pairs(type(difficulties) == "table" and difficulties or {}) do
+            if type(data) == "table" then result[dungeon][difficulty] = data end
+        end
+    end
+    return result
 end
 
-function Logic.bestGear(inventory, level, class)
+function Logic.tokens(text)
+    local result, seen = {}, {}
+    -- Roblox usernames and numeric IDs contain no whitespace. Accept pasted rows,
+    -- tabs, spaces, commas, and semicolons while keeping first-seen spelling.
+    for token in (text or ""):gmatch("[^,%s;]+") do
+        if token ~= "" and not seen[token:lower()] then
+            seen[token:lower()] = true
+            table.insert(result, token)
+        end
+    end
+    return result
+end
+
+function Logic.requestUsername(text)
+    if type(text) ~= "string" then return nil end
+    return text:match("^([%w_]+) %(LVL %d+%) wants to join your raid%.$")
+        or text:match("^([%w_]+) wants to join your raid%.$")
+end
+
+function Logic.accountRole(party, username, userId)
+    local function matches(value)
+        for _, token in ipairs(Logic.tokens(value)) do
+            if token:lower() == username:lower() or tonumber(token) == userId then return true end
+        end
+        return false
+    end
+    if matches(party.Host) then return "Host" end
+    if matches(party.Carry) then return "Carry" end
+    if matches(party.Alts) then return "Alt" end
+end
+
+function Logic.bestDungeon(catalog, level, pirateOnly)
+    local best
+    for name, stats in pairs(catalog) do
+        if not seasonal[name] and (not pirateOnly or name == "Pirate Island") then
+            for rank, difficulty in ipairs(Logic.Difficulties) do
+                local data = stats[difficulty]
+                local required = type(data) == "table" and tonumber(data.levelReq)
+                if required and level and required <= level and not data.isEventPlace and not data.isBossKey
+                    and (not best or required > best.levelReq or required == best.levelReq and rank > best.rank
+                        or required == best.levelReq and rank == best.rank and name < best.Dungeon) then
+                    best = { Dungeon = name, Difficulty = difficulty, levelReq = required, rank = rank }
+                end
+            end
+        end
+    end
+    return best
+end
+
+function Logic.sameDungeon(a, b)
+    return a and b and a.Dungeon == b.Dungeon and a.Difficulty == b.Difficulty
+end
+
+-- Protect every equipped ability slot, including the game's q2/e2 slots.
+function Logic.isEquipped(item)
+    if type(item.equipped) == "table" then
+        for _, value in pairs(item.equipped) do if value ~= false then return true end end
+        return false
+    end
+    return item.equipped ~= false
+end
+
+function Logic.slotEquipped(item, slot)
+    if type(item.equipped) ~= "table" then return false end
+    for name, value in pairs(item.equipped) do
+        if tostring(name):lower() == slot:lower() and value == true then return true end
+    end
+    return false
+end
+
+function Logic.heals(inventory)
     local result = {}
-    for _, kind in ipairs({ "weapon", "helmet", "chest" }) do
-        local best, bestScore, bestHealth = nil, -math.huge, -math.huge
+    for id, item in pairs(inventory.abilities or {}) do
+        if Logic.normalizeItemName(item.name) == "universal heal" and tostring(id):match("^ability_%d+$") then
+            table.insert(result, { id = tonumber(id:match("%d+$")), item = item })
+        end
+    end
+    table.sort(result, function(a, b)
+        local function equipped(item)
+            return Logic.isEquipped(item) and 1 or 0
+        end
+        local x, y = equipped(a.item), equipped(b.item)
+        return x > y or x == y and a.id < b.id
+    end)
+    return result
+end
+
+function Logic.tankArmor(inventory, level)
+    local result = {}
+    for _, kind in ipairs({ "helmet", "chest" }) do
+        local best
         for id, item in pairs(inventory[kind .. "s"] or {}) do
-            local required = tonumber(item.levelReq)
-            local number = id:match("^" .. kind .. "_(%d+)$")
-            if number and required and required <= level then
-                local score = tonumber(item[class == "Mage" and "spellPower" or (kind == "weapon" and "physicalDamage" or "physicalPower")]) or 0
-                local health = tonumber(item.health) or 0
-                if score > bestScore or (score == bestScore and health > bestHealth)
-                    or (score == bestScore and health == bestHealth and item.equipped == true) then
-                    bestScore, bestHealth = score, health
-                    best = { kind = kind, id = number, item = item }
+            local required, health = tonumber(item.levelReq), tonumber(item.health) or 0
+            local name = tostring(item.name or ""):lower()
+            local class = tostring(item.itemClass or item.class or ""):lower()
+            local tank = class == "tank" or name:find("guardian", 1, true) or name:find("tank", 1, true)
+                or health > 0 and (tonumber(item.spellPower) or 0) == 0 and (tonumber(item.physicalPower) or 0) == 0
+            local number = tonumber(tostring(id):match("^" .. kind .. "_(%d+)$"))
+            if tank and number and required and required <= level then
+                if not best or required > best.required or required == best.required and health > best.health
+                    or required == best.required and health == best.health and number < best.id then
+                    best = { kind = kind, id = number, item = item, required = required, health = health }
                 end
             end
         end
@@ -33,31 +151,70 @@ function Logic.bestGear(inventory, level, class)
     return result
 end
 
-function Logic.raidTiers(inventory)
-    local tiers = {}
-    for key, owned in pairs(inventory.keys or {}) do
-        local tier = tonumber(key)
-        if owned == true and tier and tier >= 1 then table.insert(tiers, tier) end
+function Logic.mageWeapon(inventory, level)
+    local best
+    for id, item in pairs(inventory.weapons or {}) do
+        local number = tonumber(tostring(id):match("^weapon_(%d+)$"))
+        local required = tonumber(item.levelReq)
+        local power = tonumber(item.spellPower) or 0
+        if number and required and required <= level and power > 0
+            and (not best or power > best.power
+                or power == best.power and required > best.required
+                or power == best.power and required == best.required and item.equipped == true and best.item.equipped ~= true
+                or power == best.power and required == best.required and item.equipped == best.item.equipped and number < best.id) then
+            best = { kind = "weapon", id = number, item = item, required = required, power = power }
+        end
     end
-    table.sort(tiers)
-    return tiers
+    return best
 end
 
-function Logic.duration(seconds)
-    seconds = math.max(0, math.floor(seconds))
-    return string.format("%02d:%02d:%02d", math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)
+function Logic.normalizeItemName(name)
+    return tostring(name or ""):lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
 end
 
-function Logic.validWebhook(url)
-    return type(url) == "string" and url:match("^https://discord%.com/api/webhooks/%d+/[%w_-]+$") ~= nil
-end
-
-function Logic.allowedPlayer(name, userId, csv)
-    for token in (csv or ""):gmatch("[^,]+") do
-        token = token:match("^%s*(.-)%s*$")
-        if token:lower() == name:lower() or tonumber(token) == userId then return true end
+function Logic.keepNames(text)
+    local keep = {}
+    -- Spaces belong to item names; only rows, commas, or semicolons separate items.
+    for name in (text or ""):gmatch("[^,;\r\n]+") do
+        name = Logic.normalizeItemName(name)
+        if name ~= "" then keep[name] = true end
     end
-    return false
+    return keep
+end
+
+function Logic.sellPlan(inventory, protected, keepItems, keepLegendary)
+    local plan, count = { weapon = {}, helmet = {}, chest = {}, ability = {} }, 0
+    local keep = {}
+    local names = Logic.keepNames(keepItems)
+    for index, heal in ipairs(Logic.heals(inventory)) do if index <= 2 then keep[heal.id] = true end end
+    for kind, ids in pairs(plan) do
+        for id, item in pairs(inventory[kind == "ability" and "abilities" or kind .. "s"] or {}) do
+            local number = tonumber(tostring(id):match("^" .. kind .. "_(%d+)$"))
+            local equipped = Logic.isEquipped(item)
+            local legendary = keepLegendary and Logic.normalizeItemName(item.rarity) == "legendary"
+            if not legendary and number and not names[Logic.normalizeItemName(item.name)] and not equipped and not item.locked and not item.favorite and not item.favourited
+                and not (kind == "ability" and keep[number]) and not (protected and protected[id]) then
+                table.insert(ids, number)
+                count = count + 1
+            end
+        end
+        table.sort(ids)
+    end
+    return plan, count
+end
+
+function Logic.partyReady(members, hostId, carryId)
+    local hostLevel, missing, equal = nil, {}, true
+    for _, member in ipairs(members) do
+        if member.id == hostId and member.present then hostLevel = member.level end
+        if not member.present then table.insert(missing, member.name) end
+    end
+    if #missing > 0 then return false, false, missing end
+    if not hostLevel then equal = false end
+    for _, member in ipairs(members) do
+        if member.id ~= carryId and (not member.level or member.level ~= hostLevel) then equal = false end
+    end
+    return true, equal, missing
 end
 
 return Logic

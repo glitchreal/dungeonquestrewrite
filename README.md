@@ -1,161 +1,217 @@
-# Dungeon Quest Obsidian
+# Dungeon Quest Rewrite · Obsidian
 
-One loader selects the Obsidian script for the current Dungeon Quest Reborn place:
+Three account roles built on the latest pathfinding farm from
+[Dungeon-quest](https://github.com/glitchreal/Dungeon-quest), including its newer
+stairs, recovery, target-facing, and bounded dodge fixes. The old movement spoof,
+raid, webhook, and miscellaneous feature panels have been removed.
 
 ```lua
 getgenv().autoexecute = true
 getgenv().autoloadconfig = true
-
 loadstring(game:HttpGet("https://raw.githubusercontent.com/glitchreal/dungeonquestrewrite/main/main.luau"))()
 ```
 
-`autoexecute` reruns the loader after teleports. `autoloadconfig` restores your
-saved settings when loading. Set either to `false` to disable that behavior.
-These two options live above the loadstring, not in the UI. The same snippet is
-in `launch.luau`.
+Run this on **every account**, initially in a lobby. In **Party**, enter the same
+host username, carry username, and selected alt usernames on all accounts.
+Paste the whole alt list using newlines, spaces, tabs, commas, or semicolons, then
+press Enter or click away. The field formats it with commas and removes duplicate entries.
+User IDs also work; display names do not. Select each account's
+role, choose its options, then use **Enable role automation** at the top of Party
+or **Start selected role** at the top of Roles. Dungeon creation requires the
+**Host** role; Carry and Alt send join requests instead. Party fields save as
+you type, and the visible text is captured again before reload/unload/teleport.
+Role automation pauses while you edit the party to avoid using partial usernames.
+Click away to resume; Enter is optional. The host and carry must
+be different accounts. The host and selected alts should begin at the same level;
+the carry can be much higher level.
 
-All toggles, sliders, inputs, selections, and the menu key save automatically
-after changes, with a final save on unload or teleport. There is no config panel
-or manual save button. Settings are stored in `DungeonQuestObsidian-config.json`
-in the executor's workspace, including any configured webhook URL. Saving and
-restoring require the executor's `writefile` and `readfile` APIs.
+Automation, auto sell, auto healer, auto skill points, and OCD recovery start
+disabled. Feature switches such as auto join and Level Kaitun are preset, but
+perform no actions until **Enable role automation** is on. Auto Sell is independent:
+turning on its own toggle runs it even with role automation off or no party configured.
 
-| Place | Place ID | Script |
+| Role | Behavior |
+| --- | --- |
+| Carry | Sends requests to the host. Level Kaitun waits for the entire selected party, starts the dungeon, then uses the existing pathfinding combat farm. Pauses whenever a selected account is absent or its level is unavailable. |
+| Host | Creates and enters the best eligible dungeon, accepts requests only from the resolved selected accounts, and replays. Starts once everyone is present; keep Level Kaitun on for the host too, so owner-restricted starts work. |
+| Alt | Sends requests to the host. Optional healer support matches the Host behavior below. |
+| Host and Alt healer support | Equips the strongest eligible mage weapon, highest-level tank helmet/chest, and up to two Universal Heals, removes other equipped skills, and casts only Universal Heal when a selected member needs health. Optional skill points go to Stamina, Spell Power, or Physical Power. |
+
+The carry alone runs the enemy pathfinding farm. Host and alt accounts wait for
+the carry; healer hosts and alts cast without approaching enemies. All roles support auto
+sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport continuation.
+
+## Progression and party recovery
+
+- Best dungeon means the highest real level requirement available to the lowest
+  selected host/alt level, with difficulty used to break ties. Live requirements
+  come from the lobby catalog; built-in normal-dungeon requirements through
+  Northern Lands keep progression working inside dungeons and repair old catalogs.
+  Special event and boss-key dungeons are excluded.
+- Hardcore and private/whitelist lobby mode are optional host settings. Automatic
+  request acceptance **always** checks the selected party, even in a public lobby.
+  The host scans existing request prompts once per second as well as listening for
+  new requests, so requests received before the script loaded are recovered.
+  Unresolved prompts are retried at most once every five seconds.
+- Before starting, every selected account must be present in the same dungeon.
+  Readable matching non-carry levels are required for progression, not starting. The configurable party-ready delay gives arrivals time to settle.
+- At the end of a run, switching waits five seconds for rewards and chooses using
+  the lowest current host/alt level. Unequal XP does not hold the party in an old
+  dungeon, and the lower account is never sent above its requirement. The host
+  returns to create the new dungeon; carry/alt accounts return and request the host
+  again. Enable Auto Best on the host and Auto Switch on the carry/alts.
+- Starting and recovery do not depend on dungeon-owner metadata. Host role
+  controls join-request handling; the game enforces owner-only actions.
+- A host disappearing is **not** treated as a level unlock. With OCD disabled, the
+  carry pauses and waits. Initial party assembly has no timeout. With OCD enabled
+  on every account, a player missing from a previously assembled party (or an
+  already-started run) for the grace period triggers lobby recovery. Requests and teleports are retried at bounded intervals.
+- Recovery remembers observed alt levels and caps the host's new selection at the
+  lowest known non-carry level so a disconnected alt is not locked out. It cannot undo XP earned before a disconnect or
+  guarantee identical XP/levels when account XP boosts differ.
+
+## Optional cross-client sync
+
+Cross-client sync reports that every selected **script** is running, not merely
+that each player is present. On one device, use `files.luau` on every account or
+enable **Require selected scripts ready** in Party. No relay, key, command, port,
+or background process is required when the executor clients share one workspace.
+
+- Each account writes only its own heartbeat file every 0.25 seconds. Readers
+  require all fresh heartbeats to name the same dungeon job and place, and to report
+  enabled and ready. Brief partial writes are ignored until the next heartbeat.
+- The host writes one job-scoped regroup command before leaving. Carry and alts
+  read it directly and follow; commands expire after 30 seconds and cannot eject a
+  newly teleported party from a different job.
+- Stale heartbeat files are harmless and may remain on disk. Timestamps and job IDs
+  prevent them from authorizing a future start. No client enumerates arbitrary
+  workspace content because roster IDs determine the exact files to read.
+- Once every account's heartbeat has been observed, the script stays on file sync
+  and fails closed if one becomes stale, disabled, paused, or moves to another job.
+- Some executors isolate each Roblox process in a separate virtual workspace. Until
+  shared files are proven, a configured HTTP relay remains an automatic fallback.
+  Without either path, the UI reports that sync is unavailable instead of starting.
+- Disabling sync restores presence-only behavior. Sync cannot inject or execute the
+  loader on another account, so run it on each account and keep teleport execution enabled.
+
+An optional private relay loader can still set
+`getgenv().DQRewriteSync = { URL = "https://YOUR-RELAY.workers.dev", Key = "YOUR-PRIVATE-KEY" }`.
+Never commit or publicly share a real relay key. File sync takes priority if the
+workspace proves shared, so existing relay-enabled loaders gain the faster path too.
+
+The deployable Cloudflare Worker is in [`src/relay`](src/relay/README.md). It uses a
+SQLite-backed Durable Object supported by the Workers Free plan. Ten continuously
+running accounts at the default interval use about 86,400 requests/day, before
+restarts and other traffic; the Free plan allowance is 100,000/day. Stay on Free:
+exceeding its quota stops requests rather than automatically buying extra capacity.
+
+If files are isolated but local HTTP is available, run `npm run local` inside
+`src/relay`. Use
+`http://127.0.0.1:8788` for native desktop Roblox clients. Android emulators commonly
+reach the host at `http://10.0.2.2:8788`; otherwise use the host computer's private
+LAN address. The local server uses the same ignored `.dev.vars` key as Cloudflare,
+stores only short-lived memory, and needs to remain open while the accounts run.
+
+## Healer provisioning and selling
+
+Enable **Farm Pirate Island for Universal Heal** on every account to coordinate
+provisioning. At level 60+, the host uses Pirate Island until the host and every selected alt
+each own at least **two Universal Heals**. The carry is excluded from heal ownership
+checks. Old one-heal readiness flags are discarded and inventories are checked again. Below Pirate Island's level-60
+requirement, it farms eligible content first. It selects the highest eligible
+Pirate difficulty. The party returns to best-dungeon progression after ownership
+is confirmed and non-carry levels match. A failed inventory inspection does not
+establish ownership. New drops are checked again after rewards settle.
+
+Host and Alt Auto Healer equips the eligible weapon with the highest spell power, then
+chooses tank/guardian armor by eligible **level first**, then health. A tank class/name or health-only armor stats identify tank gear. It equips
+two distinct heals when available; one is usable while waiting for another drop.
+Heal casting uses the game's equipped-slot event and cooldown path. The existing
+Auto Healer toggle alternates ready Q/E heals with at least four seconds between
+casts, while still waiting for each skill's real cooldown and a party member to
+need healing. One owned heal also respects its cooldown; no extra toggle is needed.
+
+Under Settings → All account types, **Keep items** accepts full item names
+separated by commas, semicolons, or pasted lines, for example
+`Enhanced Inner Focus, Enhanced Inner Rage`. Matching ignores capitalization and
+extra spaces but requires the entire name; every matching copy is protected.
+Editing the list stops Auto Sell so partially typed names cannot cause a sale.
+Re-enable Auto Sell when finished. The list saves automatically in the same
+per-account config, including across teleports.
+
+**Keep legendary items** is enabled by default and saves per account. It excludes
+all legendary weapons, helmets, chests, and abilities from selling. Turn it off
+to include legendary items, subject to the other keep rules.
+
+Auto Sell covers every rarity for weapons, helmets, chests, and abilities. It
+retains up to two Universal Heals, including when only one exists, and preserves
+equipped, locked, and favorite items plus pending healer equipment. Gear is
+refreshed after equipping before a sale is computed. Trading pauses inventory
+mutations. All equipped ability slots, including Q2/E2, are protected; unknown
+equipped status is also kept. The sale readout distinguishes requests from items
+confirmed removed by the next inventory scan. Auto Sell is intentionally opt-in
+on each account and requires neither party setup nor dungeon catalog loading.
+
+## Settings and execution
+
+Settings use shared **Carry**, **Host**, and **Alt** profiles. On execution, the
+script matches the current Roblox username or UserId against the shared Host,
+Carry, and Selected alts fields, then loads that role's saved settings. All listed
+alts load the Alt profile. Unlisted accounts retain their own saved settings
+until configured. Reload an account after changing the shared party/profile.
+
+Files in the executor workspace:
+
+- `DungeonQuestRewrite-party.json`: shared Host, Carry, and Selected alts.
+- `DungeonQuestRewrite-role-Carry.json`, `-Host.json`, `-Alt.json`: settings per role.
+- `DungeonQuestRewrite-<userId>.json`: account fallback and runtime observations.
+- `DungeonQuestRewrite-sync/<party-id>/<userId>.json`: per-account sync heartbeat.
+- `DungeonQuestRewrite-sync/<party-id>/command.json`: short-lived host regroup command.
+
+Role profiles publish on user edits. Periodic saves and teleports update only the
+account file, so idle accounts do not overwrite shared settings. An in-memory
+teleport snapshot takes precedence over shared profiles on arrival. An existing
+account config seeds a missing role profile when its party identifies that account.
+Party text saves while typing and is captured again before unload/teleport.
+Role automation pauses during party edits to avoid using unfinished usernames.
+Accounts must share the executor's file workspace to share profiles; the same HWID
+alone does not make separate executor folders share files. `autoloadconfig = false`
+starts with defaults and skips shared profiles too.
+
+From Ghastly Harbor through Northern Lands, combat navigation follows each map's
+ordered room checkpoints whenever an enemy is replicated behind walls. Visible
+enemies take priority over stale through-wall target locks, preventing the carry
+from circling adjacent rooms or repeatedly walking into a locked doorway.
+
+Right Shift toggles the Obsidian menu; the key is configurable. Hide UI applies
+on execution. CPU saver disables 3D rendering, caps FPS at 30, and reduces visual
+effects without changing game speed or the combat controller's dodge limits.
+Disabling it or unloading restores the changed properties.
+
+`autoexecute = true` queues the **main loader** after teleports so the destination
+loads the right bundle. This requires `queue_on_teleport` or a supported alias.
+Without it, rerun the loader after teleporting. Saving requires executor file APIs.
+Unsupported places exit without running automation.
+
+| Place | Place ID | Bundle |
 | --- | --- | --- |
-| Main lobby | `77649408247578` | `dist/lobby.luau` |
+| Lobby | `77649408247578` | `dist/lobby.luau` |
 | Level 100+ lobby | `115445507767090` | `dist/lobby.luau` |
-| Dungeon, raid, wave defense | `85776757589518` | `dist/dungeon.luau` |
+| Dungeon | `85776757589518` | `dist/dungeon.luau` |
 
-The lobby script opens the Lobby tab and handles queue creation, starting runs,
-gear, stats, and player settings. It does not load the combat controller or scan
-for enemies. Dungeon settings remain available to configure before entering a run.
+## Development
 
-The dungeon script opens the Dungeon tab and loads combat, enemy-facing,
-bounded teleport dodges, replay, and run tracking. Both use the same Obsidian UI.
-Unsupported places exit with a message instead of loading the wrong script.
+`src/HubLogic.luau` contains pure eligibility, roster, equipment, and sale policy.
+`src/GameAdapter.luau` owns inspected game interfaces. `src/RoleController.luau`
+coordinates the three roles. `src/ObsidianHub.luau` owns UI, lifecycle, settings,
+and performance. Combat, ability scheduling, farm planning, and threat geometry
+remain separate modules.
 
-With `autoexecute = true`, settings and session totals are carried forward and the **main loader
-runs again**, selecting the destination's script. This requires the executor's
-`queue_on_teleport` API or supported alias. Without it, rerun the same loader after
-teleporting. Right Shift toggles the menu.
+After runtime edits, run `lua build.lua` from this repository and commit both
+generated bundles. Do not add a pre-commit test gate or rerun tests only to commit.
+The Obsidian library remains pinned to its original revision.
 
-## Features
-
-- Player: optional speed/jump overrides, cosmetic name/level displays, eligible
-  warrior/mage gear selection, and skill-point allocation.
-- Dungeon: position/distance controls, abilities, optional hover, auto dodge,
-  replay, join allowlist, and session statistics.
-- Lobby: live difficulty requirements, automatic creation/start, private lobbies,
-  hardcore, and wave defense.
-- Farm Visuals: target line, waypoints, FPS cap, rendering/effect switches, and
-  reversible lighting/shadow reductions.
-- Raids: owned-key tier selection, creation/start, replay, and next-tier eligibility.
-- Webhooks: selected run fields, drop images, and manual test/log sends.
-- Settings: unload, menu key, and teleport-continuation status. Config saving is automatic.
-
-Eligibility uses the real game level and owned keys, including higher-level
-content. Cosmetic spoofing does not change eligibility. Normal teleport dodges are capped
-at 8 studs, half a second apart, and three dodges/eighteen studs per rolling three seconds.
-The Protector-specific response approaches his flank, keeps circling in spell
-range, and prefers inward-diagonal escapes that close distance while reducing
-danger. It retains the normal short teleport limits. Sideways and backward
-detours remain available around corners; reachable exits and recent destination
-history help avoid repeatedly choosing a dead end.
-Those same shared limits also apply to emergency dodges from incoming regular
-enemies; a visible attack marker is no longer required for close melee danger.
-Retreat stays active until predicted separation clears an additional five-stud
-margin, and escape steps are renewed before the character reaches their endpoint.
-
-Dodges use announced boss telegraphs and observed active attack geometry. Escape
-goals account for nearby enemies in every direction, and movement checks prevent
-re-entering an active hitbox after a teleport. When a short teleport cannot clear
-a large attack, the controller continues walking outward while attacking when
-the target remains in range and visible. Static safe-zone/spawn markers are
-excluded; no movement-speed increase is required.
-Solo Hitless Safety is enabled by default. While alone it keeps dodge protection
-active, scans threats from farther away, increases telegraph margins and projectile
-lookahead, retains named attack parts that activate later in the run, and treats
-active beam/laser geometry as a hazard. Dodge teleports remain bounded to the
-normal anticheat-safe limits. Client-visible attacks can be predicted; damage
-with no replicated telegraph or geometry can only be handled after it appears.
-Approach steps also check enemies' predicted positions half a second ahead.
-This lets the controller brake or retreat before a closing enemy reaches it,
-including enemies arriving from behind and larger enemy bodies.
-Target selection refreshes every 0.15 seconds, preferring the closest nearby
-enemy in clear sight over one behind a wall. Switching to a different area
-invalidates the old route; switches within a close group preserve smooth walking.
-When a target is replicated through a wall, the controller follows the dungeon's
-ordered room checkpoints. This applies dynamically to every map that exposes
-checkpoint parts and avoids cutting across folded rooms or locked doors.
-
-Abilities use the equipped tools' real cooldowns and the game's normal
-`localEvent` / `abilityUsed` activation path. The scheduler skips unavailable
-slots, respects `busyCasting`, and avoids casting while you type. Cast totals
-advance when the cooldown activates, rather than on attempted key presses.
-The Combat Status group shows equipped ability cooldowns, target health, active
-hazards, path calculations, and the most recent damage event.
-
-Short clear routes use direct walking after body-width and ground-support checks.
-Escape and recovery steps check the whole route for gaps, not just the landing
-point. Enemy avoidance checks the full predicted crossing path for each nearby
-enemy, so moving away from one cannot mask entering another's danger radius.
-Adaptive Safety Spacing adds three studs briefly after a hit and up to eight
-studs at low health; the larger buffer applies, rather than stacking both. It is
-enabled by default and can be disabled to keep exactly the configured spacing.
-Dynamic distance reads the currently equipped weapon, including mid-run changes.
-
-Smart Farming is enabled by default and profiles equipped moves from tool
-attributes, value fields, ability types, and inventory descriptions. It handles
-heals, shields, buffs, self-area attacks, splash attacks, and ordinary targeted
-spells without a spell-name whitelist. Equipped tools are rediscovered as they
-change; inventory descriptions refresh every 30 seconds.
-
-Positive range and radius metadata take priority when supplied by the game.
-Splash attacks score compact visible groups while movement retains its nearest
-enemy. Self-area attacks wait for close enemies; heals wait for health below 85%,
-shields for danger, and buffs for nearby combat. Healing can run outside attack
-range. Unknown moves retain normal targeting and configured range estimates.
-Spam Abilities has a 0.35-second request floor and is suppressed during active
-hazards or escape movement. Hover is suppressed during active hazards so its
-vertical force cannot interfere with a dodge.
-The client does not expose exact ranges for every spell: the status readout marks
-missing ranges as estimated, and grouping/close-AoE sliders supply fallbacks.
-Spell Range is the fallback/override for moves without a verified range; metadata
-still wins when the game provides a positive range. It is adjustable from 8 to
-100 studs and does not increase server reach by itself.
-
-During cooldowns, the bot holds a safe useful range instead of needlessly closing
-the gap; threat avoidance still takes priority. Grouping Radius and Close AoE
-Distance are adjustable estimates, not verified server damage radii. The group
-count in Combat Status estimates potential coverage and is not a confirmed hit
-counter. Smart Farming can be disabled to restore ordinary targeting.
-
-Automation, movement overrides, hover, and logging are off by default. Auto
-Dungeon enables combat; Auto Create Lobby and Auto Start Dungeon enable queueing.
-With `autoloadconfig = true`, existing settings are retained when reloading or
-changing places. Turning autoload off starts with default controls; subsequent
-changes still save automatically.
-
-This is an executor script, not a standard Studio LocalScript. It requires
-`loadstring` and `game:HttpGet`; file saving, FPS controls, HTTP requests, and teleport
-continuation depend on the corresponding executor APIs.
-
-## Source
-
-This repository contains only the Obsidian project. `main.luau` is the public
-entry point; `src/Lobby.luau` and `src/Dungeon.luau` contain place-specific logic.
-`src/CombatController.luau` has no separate legacy UI. Shared controls and game
-interfaces are in `src/ObsidianHub.luau`, `src/GameAdapter.luau`, and
-`src/HubLogic.luau`. Ready-slot casting is in `src/AbilityController.luau`, and
-collision/trajectory calculations are in `src/ThreatGeometry.luau`.
-`src/FarmPlanner.luau` contains group scoring and cooldown-farming policy.
-
-After changing source, rebuild and commit the generated scripts with it:
-
-```sh
-lua build.lua
-```
-
-The build writes `dist/lobby.luau` and `dist/dungeon.luau`. Runtime bundles include
-their dependencies together, so each load uses one consistent bundle. The
-external [Obsidian library](https://docs.mspaint.cc/obsidian) is pinned to a revision.
+Validation for this rewrite includes Luau compilation, focused policy/state
+checks, live lobby UI loading, and inspection of both lobby and dungeon remotes.
+A single connected client cannot validate a full carry/host/alt run, cross-account
+reconnection, or actual multi-account drops; those remain live integration checks.

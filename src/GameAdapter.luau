@@ -1,12 +1,11 @@
--- Interfaces verified against Dungeon Quest Reborn's client queue/inventory scripts.
+-- Game interfaces inspected in both lobby and dungeon clients, September 2026.
 local Adapter = {}
 local Players = game:GetService("Players")
 local RS = game:GetService("ReplicatedStorage")
 local player = Players.LocalPlayer
 local PM = require(RS:WaitForChild("Utility"):WaitForChild("PlaceManager"))
 local remotes = RS:WaitForChild("remotes")
-Adapter.Remotes = remotes
-Adapter.PlaceManager = PM
+Adapter.Remotes, Adapter.PlaceManager = remotes, PM
 
 function Adapter.value(root, name, fallback)
     local child = root and root:FindFirstChild(name)
@@ -14,158 +13,169 @@ function Adapter.value(root, name, fallback)
     return fallback
 end
 
-function Adapter.level()
-    if Adapter.value(player, "dataLoaded", true) == false then return nil end
-    return Adapter.value(player:FindFirstChild("leaderstats"), "Level", nil)
-end
-
-function Adapter.balances()
-    local stats = player:FindFirstChild("leaderstats")
-    return { Coins = Adapter.value(stats, "Gold", 0), Gems = Adapter.value(stats, "Gems", 0), Levels = Adapter.level() or 0 }
+function Adapter.level(who)
+    who = who or player
+    if Adapter.value(who, "dataLoaded", true) == false then return nil end
+    return tonumber(Adapter.value(who:FindFirstChild("leaderstats"), "Level", nil))
 end
 
 function Adapter.call(name, ...)
     local remote = remotes:FindFirstChild(name)
-    if not remote then error("Game interface unavailable: " .. name) end
+    assert(remote, "Game interface unavailable: " .. name)
     if remote:IsA("RemoteFunction") then return remote:InvokeServer(...) end
     remote:FireServer(...)
     return true
 end
 
-function Adapter.inventory()
-    local inventory = Adapter.call("reloadInvy")
-    assert(type(inventory) == "table", "Inventory is not loaded")
+function Adapter.inventory(who)
+    local inventory
+    if who and who ~= player then inventory = Adapter.call("getOtherPlayersInvy", who)
+    else inventory = Adapter.call("reloadInvy") end
+    assert(type(inventory) == "table" and type(inventory.abilities) == "table", "Inventory is not loaded")
     return inventory
 end
 
-function Adapter.dungeons()
-    local names = {}
+function Adapter.catalog()
     local gui = player.PlayerGui:FindFirstChild("queueGui")
     local choose = gui and gui:FindFirstChild("chooseDungeon")
     local left = choose and choose:FindFirstChild("backgroundFillLeft")
     local list = left and left:FindFirstChild("ScrollingFrame")
-    if list then
-        for _, row in ipairs(list:GetChildren()) do
-            if row:IsA("ImageLabel") and row:FindFirstChild("TextButton") and row.Name ~= "Tutorial Dungeon" then
-                table.insert(names, row.Name)
-            end
-        end
-    end
-    table.sort(names)
-    return names
-end
-
-local dungeonStats = {}
-function Adapter.dungeonStats(name)
-    if dungeonStats[name] then return dungeonStats[name] end
-    local result = Adapter.call("getDungeonStats", name)
-    assert(type(result) == "table", "Dungeon requirements unavailable")
-    dungeonStats[name] = result
-    return result
-end
-
-local function eligibleDifficulties(stats, level)
-    local result = {}
-    for _, difficulty in ipairs({ "Easy", "Medium", "Hard", "Insane", "Nightmare" }) do
-        local entry = stats and stats[difficulty]
-        local required = type(entry) == "table" and tonumber(entry.levelReq)
-        if required and level >= required then
-            table.insert(result, { name = difficulty, levelReq = required })
-        end
-    end
-    return result
-end
-
--- Saved settings can outlive a level change or an account swap. Resolve them
--- at queue time so one stale high-level selection cannot stop auto farming.
-function Adapter.resolveLobby(config)
-    local level = Adapter.level()
-    assert(level, "Player level is not loaded")
-    local requestedDungeon = config.Dungeon
-    local requestedOk, requestedStats = pcall(Adapter.dungeonStats, requestedDungeon)
-    local eligible = requestedOk and eligibleDifficulties(requestedStats, level) or {}
-    local dungeon = requestedDungeon
-    if #eligible == 0 then
-        local best, bestScore
-        for _, name in ipairs(Adapter.dungeons()) do
-            local ok, stats = pcall(Adapter.dungeonStats, name)
-            if ok then
-                local available = eligibleDifficulties(stats, level)
-                local highest = available[#available]
-                if highest and (not bestScore or highest.levelReq > bestScore) then
-                    best, bestScore = { name = name, difficulty = highest.name, levelReq = highest.levelReq }, highest.levelReq
+    assert(list, "Dungeon catalog unavailable; load once in the lobby")
+    local catalog = {}
+    for _, row in ipairs(list:GetChildren()) do
+        if row:IsA("ImageLabel") and row:FindFirstChild("TextButton") and row.Name ~= "Tutorial Dungeon" then
+            local stats = Adapter.call("getDungeonStats", row.Name)
+            if type(stats) == "table" then
+                catalog[row.Name] = {}
+                for _, difficulty in ipairs(Logic.Difficulties) do
+                    local data = stats[difficulty]
+                    if type(data) == "table" and tonumber(data.levelReq) then
+                        catalog[row.Name][difficulty] = { levelReq = tonumber(data.levelReq),
+                            isEventPlace = data.isEventPlace, isBossKey = data.isBossKey }
+                    end
                 end
             end
         end
-        assert(best, "No dungeon is unlocked at level " .. tostring(level))
-        dungeon, eligible = best.name, { { name = best.difficulty, levelReq = best.levelReq } }
     end
-    local selected = nil
-    for _, option in ipairs(eligible) do
-        if option.name == config.Difficulty then selected = option end
-    end
-    selected = selected or eligible[#eligible]
-    config.Dungeon, config.Difficulty = dungeon, selected.name
-    return dungeon, selected.name, selected.levelReq
+    assert(next(catalog), "Waiting for dungeon catalog")
+    return Logic.catalog(catalog)
 end
 
-function Adapter.findLobby(raid, desiredDungeon)
-    local games = workspace:FindFirstChild(raid and "bossLobbies" or "games")
-    if not games then return nil end
-    local list = raid and games or games:FindFirstChild("inLobby")
-    if not list then return nil end
-    for _, lobby in ipairs(list:GetChildren()) do
-        local members = raid and lobby:FindFirstChild("players") or lobby
-        if lobby.Name == player.Name or (members and members:FindFirstChild(player.Name)) then
-            if desiredDungeon then
-                local mapName = Adapter.value(lobby, "mapName", nil)
-                if mapName and mapName ~= desiredDungeon then continue end
-            end
-            return lobby
-        end
+local identities = {}
+function Adapter.identity(token)
+    token = token:match("^%s*(.-)%s*$")
+    assert(token ~= "", "Enter the host, carry, and selected alt usernames")
+    local key = token:lower()
+    if identities[key] then return identities[key] end
+    local id = tonumber(token) or Players:GetUserIdFromNameAsync(token)
+    assert(id and id > 0 and id % 1 == 0, "Invalid account: " .. token)
+    local result = { id = id, name = Players:GetNameFromUserIdAsync(id) }
+    identities[key] = result
+    return result
+end
+
+function Adapter.roster(config)
+    local host, carry = Adapter.identity(config.Host), Adapter.identity(config.Carry)
+    assert(host.id ~= carry.id, "Host and carry must be different accounts")
+    local roster, seen = { host, carry }, { [host.id] = true, [carry.id] = true }
+    for _, token in ipairs(Logic.tokens(config.Alts)) do
+        local account = Adapter.identity(token)
+        if not seen[account.id] then table.insert(roster, account); seen[account.id] = true end
     end
-    return nil
+    assert(seen[player.UserId], "This account must be in the party list")
+    assert(config.Role ~= "Host" or host.id == player.UserId, "Host role must match the host username")
+    assert(config.Role ~= "Carry" or carry.id == player.UserId, "Carry role must match the carry username")
+    assert(config.Role ~= "Alt" or player.UserId ~= host.id and player.UserId ~= carry.id, "Alt role must be a selected alt")
+    return roster, host, carry
 end
 
-function Adapter.createLobby(config)
-    local dungeon, difficulty, levelReq = Adapter.resolveLobby(config)
-    return Adapter.call("createLobby", dungeon, difficulty, levelReq,
-        config.Hardcore and not config.WaveDefence, config.PrivateLobby, config.WaveDefence)
+function Adapter.members(roster)
+    local members = {}
+    for _, account in ipairs(roster) do
+        local who = Players:GetPlayerByUserId(account.id)
+        table.insert(members, { id = account.id, name = account.name, present = who ~= nil,
+            level = who and Adapter.level(who), player = who })
+    end
+    return members
 end
 
-function Adapter.replayData()
-    local data = {}
+function Adapter.findLobby()
+    local games = workspace:FindFirstChild("games")
+    local list = games and games:FindFirstChild("inLobby")
+    if list then return list:FindFirstChild(player.Name) end
+end
+
+function Adapter.lobbyMatches(lobby, selection, config)
+    local map = lobby and lobby:FindFirstChild("mapName")
+    return Adapter.value(lobby, "mapName") == selection.Dungeon
+        and Adapter.value(map, "difficulty") == selection.Difficulty
+        and Adapter.value(map, "hardcore") == config.Hardcore
+        and Adapter.value(map, "private") == config.Whitelist
+        and Adapter.value(map, "waveDefence", false) == false
+end
+
+function Adapter.createLobby(selection, config)
+    local level = assert(Adapter.level(), "Player level is not loaded")
+    assert(selection and level >= selection.levelReq, "Dungeon is locked at your level")
+    return Adapter.call("createLobby", selection.Dungeon, selection.Difficulty, selection.levelReq,
+        config.Hardcore, config.Whitelist, false)
+end
+
+function Adapter.currentDungeon()
     local teleport = PM.GetPlaceTeleportData()
-    for k, v in pairs(teleport and teleport.dungeonStats or {}) do data[k] = v end
-    for _, name in ipairs({ "dungeonName", "dungeonProgress", "dungeonStarted", "hardcore" }) do
-        local value = Adapter.value(workspace, name, nil)
-        if value ~= nil then data[name] = value end
+    local data = teleport and teleport.dungeonStats or {}
+    return { Dungeon = Adapter.value(workspace, "dungeonName", data.dungeonName), Difficulty = data.difficulty,
+        levelReq = tonumber(data.levelReq) }
+end
+
+function Adapter.ownerId()
+    -- Join-request arrivals may omit the original owner in teleport data.
+    -- The server's active owner is authoritative, including ownership changes.
+    local active = tonumber(RS:GetAttribute("ActiveDungeonOwnerId"))
+    if active and active > 0 then return active end
+    if type(PM.GetDungeonOwnerId) == "function" then
+        local id = tonumber(PM.GetDungeonOwnerId())
+        if id and id > 0 then return id end
     end
-    local dungeon = workspace:FindFirstChild("dungeon")
-    if dungeon then
-        for _, container in ipairs({ dungeon, dungeon:FindFirstChild("bossRoom") }) do
-            for _, child in ipairs(container:GetChildren()) do
-                if child:IsA("ValueBase") then data[child.Name] = child.Value end
-            end
+    local teleport = PM.GetPlaceTeleportData()
+    local id = teleport and (tonumber(teleport.ownerId)
+        or type(teleport.dungeonStats) == "table" and tonumber(teleport.dungeonStats.ownerId))
+    return id and id > 0 and id or nil
+end
+
+function Adapter.pendingRequests()
+    local pending = {}
+    for _, gui in ipairs(player.PlayerGui:GetChildren()) do
+        local id = gui.Name:match("^joinRequestConfirm_(.+)$")
+        if id and gui:IsA("ScreenGui") and gui.Enabled then
+            local frame = gui:FindFirstChild("Frame")
+            local body = frame and frame:FindFirstChild("Frame")
+            local status = body and body:FindFirstChild("status")
+            local name = status and Logic.requestUsername(status.Text)
+            if name then table.insert(pending, { id = tonumber(id) or id, name = name, prompt = gui }) end
         end
     end
-    assert(type(data.dungeonName) == "string", "Run data is not available")
-    return data
+    return pending
+end
+
+function Adapter.failed()
+    return player.PlayerGui:FindFirstChild("failedGui") ~= nil
 end
 
 function Adapter.finished()
     if Adapter.value(workspace, "dungeonProgress", "") == "bossKilled" then return true end
     local dungeon = workspace:FindFirstChild("dungeon")
-    local boss = dungeon and dungeon:FindFirstChild("bossRoom")
-    return Adapter.value(boss, "dungeonFinished", false) == true
+    return Adapter.value(dungeon and dungeon:FindFirstChild("bossRoom"), "dungeonFinished", false) == true
 end
 
-function Adapter.replay(advance)
-    assert(PM.IsDungeonOwner(player), "Only the dungeon owner can replay")
-    local data = Adapter.replayData()
-    if advance and PM.IsBossKey() then
-        local nextTier = Adapter.call("checkNextTierKey")
-        data.advanceTier = type(nextTier) == "table" and nextTier.eligible == true
+function Adapter.replay()
+    assert(PM.IsDungeonOwner(player), "Only the host can replay")
+    local teleport = PM.GetPlaceTeleportData()
+    local data = table.clone(teleport and teleport.dungeonStats or {})
+    assert(type(data.dungeonName) == "string", "Run data unavailable")
+    for _, name in ipairs({ "dungeonName", "dungeonProgress", "dungeonStarted", "hardcore" }) do
+        local value = Adapter.value(workspace, name, nil)
+        if value ~= nil then data[name] = value end
     end
     return Adapter.call("replayDungeon", data)
 end

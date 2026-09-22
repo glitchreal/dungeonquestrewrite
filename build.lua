@@ -20,10 +20,12 @@ for _, route in ipairs({ "lobby", "dungeon" }) do
             .. "    return\nend\n",
         module("Logic", "src/HubLogic.luau"),
         module("Adapter", "src/GameAdapter.luau"),
+        module("AbilityController", "src/AbilityController.luau"),
+        module("PartySync", "src/PartySync.luau"),
+        module("Roles", "src/RoleController.luau"),
     }
     if route == "dungeon" then
         table.insert(parts, module("ThreatGeometry", "src/ThreatGeometry.luau"))
-        table.insert(parts, module("AbilityController", "src/AbilityController.luau"))
         table.insert(parts, module("FarmPlanner", "src/FarmPlanner.luau"))
         table.insert(parts, "local function createController()\n" .. read("src/CombatController.luau") .. "\nend\n")
     end
