@@ -2155,7 +2155,11 @@ local function controllerTick()
         state.lastThreatPart, state.dodgeGoal = nil, nil
         restoreFacing()
         local routeGoal, routeAnchor = mapRouteGoal(rootPart)
-        if routeGoal and distance > 35 then
+        -- On checkpoint-guided maps, a nearby enemy can still be behind a
+        -- closed room door or on the next platform. A distance cutoff made
+        -- those targets drive directly into the obstruction instead of
+        -- advancing through the ordered room route.
+        if routeGoal then
             state.status = "Following " .. tostring(state.routeDungeon) .. " route: " .. routeAnchor.name
             followGoal(humanoid, rootPart, routeGoal, "map-route", now, target)
             updateProgress(humanoid, rootPart, routeGoal, target, now)
