@@ -419,8 +419,13 @@ local function refreshRouteAnchors(force)
             local room = instance.Parent
             while room and room.Parent ~= dungeon do room = room.Parent end
             local roomName = room and room.Name or instance.Parent.Name
+            -- Northern Lands exposes an explicit IntValue order on each room.
+            -- Prefer it over names so renamed/streamed rooms still follow the
+            -- server route; retain name parsing for older dungeon layouts.
+            local orderValue = room and room:FindFirstChild("order")
+            local explicitOrder = orderValue and orderValue:IsA("ValueBase") and tonumber(orderValue.Value)
             local number = tonumber(roomName:lower():match("room[%s_%-]*(%d+)"))
-            local order = number or (roomName:lower():find("boss", 1, true) and 1000 or 900)
+            local order = explicitOrder or number or (roomName:lower():find("boss", 1, true) and 1000 or 900)
             table.insert(state.routeAnchors, { part = instance, order = order, name = roomName, key = instance:GetFullName() })
         end
     end

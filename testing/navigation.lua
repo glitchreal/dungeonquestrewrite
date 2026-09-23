@@ -7,8 +7,11 @@ vector.__sub=function(a,b) return V(a.X-b.X,a.Y-b.Y,a.Z-b.Z) end
 vector.__add=function(a,b) return V(a.X+b.X,a.Y+b.Y,a.Z+b.Z) end
 local checkpoints={}
 local dungeon={QueryDescendants=function() return checkpoints end}
-local function checkpoint(roomName,x,y)
-    local room={Name=roomName,Parent=dungeon}
+local function checkpoint(roomName,x,y,explicitOrder)
+    local order=explicitOrder or tonumber(roomName:match('room(%d+)'))
+    local room={Name=roomName,Parent=dungeon,FindFirstChild=function(self,name)
+        if name=='order' and order then return {Value=order,IsA=function(_,kind) return kind=='ValueBase' end} end
+    end}
     local p={Name='checkpoint',Parent=room,Position=V(x,y,0),GetFullName=function() return 'dungeon.'..roomName..'.checkpoint' end}
     checkpoints[#checkpoints+1]=p;return p
 end
@@ -25,6 +28,6 @@ local root={Position=V(0,50,0),Parent={}}
 local _,anchor=getGoal(root);assert(anchor.name=='room1','Different floor must not skip room checkpoint')
 root.Position=V(0,3,0);_,anchor=getGoal(root);assert(anchor.name=='room2')
 root.Position=V(100,3,0);_,anchor=getGoal(root);assert(anchor.name=='bossRoom')
-checkpoint('room3',150,0);refresh(true);_,anchor=getGoal(root)
-assert(anchor.name=='room3','Streaming refresh must include new forward checkpoint without backtracking')
+checkpoint('renamed',150,0,3);refresh(true);_,anchor=getGoal(root)
+assert(anchor.name=='renamed','Explicit room order must survive renamed streamed checkpoints')
 print('PASS checkpoint floor tolerance, forward advancement, streaming refresh without backtracking')
