@@ -101,3 +101,15 @@ Only Host owns the start action, so that counter was misleading on Carry/Alt and
 made auto-farm appear stuck. Carry/Alt now immediately show `Waiting for Host to
 start`; the delay counter is Host-only and its displayed elapsed value is capped at
 the configured delay.
+
+
+## Northern Lands port audit
+
+The old `Dungeon-quest` controller was audited for route memory, attack-pattern
+memory, failed-edge/cell costs, movement arbitration, elevated approach, and live
+hazard diagnostics. The rewrite already had the better bounded checkpoint watchdog,
+visible-target preference, projectile/beam geometry, grounded approach, and metadata
+driven AoE planner. Those systems were retained. A bounded `NavigationMemory` layer
+now adds decaying confidence weighted route-edge, boss-spacing, and recovery evidence
+without overriding current geometry. Live mechanic labels expose beam, colored-orb,
+jump-slam, and projectile-corridor state; current hazards remain authoritative.

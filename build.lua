@@ -22,6 +22,7 @@ for _, route in ipairs({ "lobby", "dungeon" }) do
         module("Adapter", "src/GameAdapter.luau"),
         module("AbilityController", "src/AbilityController.luau"),
         module("AdaptivePolicy", "src/AdaptivePolicy.luau"),
+        module("NavigationMemory", "src/NavigationMemory.luau"),
         module("PartySync", "src/PartySync.luau"),
         module("Roles", "src/RoleController.luau"),
         module("BoostManager", "src/BoostManager.luau"),

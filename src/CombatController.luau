@@ -153,9 +153,14 @@ local state = {
     routeAnchorIndex = 1,
     adaptiveTarget = nil,
     targetStrategy = "visible",
+    routeEdge = nil,
+    routeCost = 0,
+    movementOwner = "idle",
+    mechanic = nil,
 }
 
 local adaptive = AdaptivePolicy.new()
+local navigation = NavigationMemory.new()
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
 -- Lets a later hit be explained from the previous ~60s of decisions.
@@ -441,7 +446,8 @@ local function mapRouteGoal(rootPart)
         if Vector3.new(delta.X, 0, delta.Z).Magnitude <= policy.reach and math.abs(delta.Y) <= policy.height
             and not hasBlockingRay(rootPart.Position, anchor.part.Position + Vector3.new(0, 2.5, 0), rootPart.Parent) then
             for passed = state.routeAnchorIndex, index do state.routePassed[state.routeAnchors[passed].key] = true end
-            state.routePassedOrder = anchor.order
+            navigation:observe("route|" .. tostring(state.routeDungeon), state.routeEdge or ("edge:" .. tostring(index)), 1, os.clock())
+            state.routeCost, state.routePassedOrder = 0.5, anchor.order
             state.routeAnchorIndex = index + 1
         end
     end
@@ -450,7 +456,12 @@ local function mapRouteGoal(rootPart)
         if not anchor then return nil end
         if not anchor.part.Parent or state.routePassed[anchor.key] then
             state.routeAnchorIndex = state.routeAnchorIndex + 1
-        else return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor end
+        else
+            local edge = "edge:" .. tostring(state.routeAnchorIndex) .. ">" .. tostring(anchor.order)
+            state.routeEdge = edge
+            state.routeCost = navigation:score("route|" .. tostring(state.routeDungeon), edge, os.clock())
+            return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+        end
     end
 end
 
@@ -595,6 +606,7 @@ local function finishAdaptiveTarget(now, terminal)
     if now - (entry.startedAt or now) < 1.25 then reward = reward * 0.5 end
     adaptive:observe(entry.targetContext, entry.targetAction, reward)
     adaptive:observe(entry.rangeContext, entry.rangeAction, reward)
+    navigation:observe("spacing|" .. tostring(game.PlaceId) .. "|" .. kind, entry.rangeAction, reward, now)
     state.adaptiveTarget = nil
 end
 
@@ -612,7 +624,8 @@ local function beginAdaptiveTarget(target, humanoid, now)
         targetContext = adaptiveTargetContext() .. "|" .. kind,
         targetAction = state.targetStrategy or "visible",
         rangeContext = rangeContext,
-        rangeAction = adaptive:choose(rangeContext, RANGE_ACTIONS, "base"),
+        rangeAction = navigation:choose(rangeContext, RANGE_ACTIONS, now)
+            or adaptive:choose(rangeContext, RANGE_ACTIONS, "base"),
         startHealth = humanoid.Health,
         lastHealth = humanoid.Health,
         startDamage = state.damageEvents,
@@ -900,6 +913,8 @@ end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    state.movementOwner = mode == "map-route" and "room navigation"
+        or mode == "approach" and "combat approach" or mode == "combat" and "combat DPS" or "recovery" and "safe recovery" or mode
     -- Flying targets bob up and down; a climb goal set during an upward bob
     -- goes stale when the target comes back down. Drop it instead of pacing
     -- between tiers.
@@ -1906,6 +1921,7 @@ end
 
 
 local function handleSafety(humanoid, rootPart, target, targetRoot, now)
+    state.movementOwner = "emergency hazard escape"
     if not CFG.AUTO_DODGE then
         state.escapeGoal, state.lastThreatPart, state.movementBlocked, state.retreating = nil, nil, false, false
         return false
@@ -2150,6 +2166,7 @@ local function progressWatchdog(rootPart, target, now, routeGoal, routeAnchor)
         state.inaccessibleTargets = state.inaccessibleTargets or setmetatable({}, { __mode = "k" })
         state.inaccessibleTargets[target] = now + 6
     end
+    if state.routeEdge then navigation:observe("route|" .. tostring(state.routeDungeon), state.routeEdge, -1, now) end
     state.lockedTarget, state.currentTarget, state.motionGoal, state.fallbackGoal = nil, nil, nil, nil
     state.lastTargetChoice, state.pathUpdateTime, state.routeFails = 0, 0, 0
     clearPath()
@@ -2168,6 +2185,15 @@ local function controllerTick()
     end
 
     local now = os.clock()
+    state.mechanic = nil
+    for _, zone in ipairs(state.activeZones) do
+        local name = tostring(zone.name or (zone.id and zone.id.Name) or ""):lower()
+        if name:find("beam", 1, true) then state.mechanic = "beam"
+        elseif name:find("orb", 1, true) then state.mechanic = "colored orb"
+        elseif name:find("slam", 1, true) or name:find("jump", 1, true) then state.mechanic = "jump slam"
+        elseif name:find("projectile", 1, true) or name:find("shot", 1, true) then state.mechanic = "projectile corridor" end
+        if state.mechanic then break end
+    end
     CFG.ATTACK_RANGE = CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or 26
     if CFG.SMART_FARM then
         local snapshots = abilities.Snapshot(now)
@@ -2269,6 +2295,7 @@ local function controllerTick()
     refreshSafety(rootPart, now)
     if handleSafety(humanoid, rootPart, target, targetRoot, now) then
         state.navigationPhase = "evade"
+        state.movementOwner = "mandatory boss mechanic"
         if CFG.AUTO_ABILITIES and CFG.SMART_FARM then
             abilities.TryCast(now, CFG.SKILL_COOLDOWN, function(slot, snapshot)
                 return FarmPlanner.profile(snapshot).mode == "buff" and prepareSpell(slot, snapshot)
@@ -2413,13 +2440,17 @@ local function controllerTick()
             state.wanderGoal = nil
         end
         state.status = "Routing around obstacle to " .. target.Name
+        local elevated = targetRoot.Position.Y - rootPart.Position.Y > 8
+        local groundedTarget = groundPosition(Vector3.new(targetRoot.Position.X, rootPart.Position.Y, targetRoot.Position.Z), character, target)
         local approachGoal = protectorApproach or (protectorRear
-            and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target)) or targetRoot.Position
+            and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target))
+            or (elevated and groundedTarget) or targetRoot.Position
         followGoal(humanoid, rootPart, approachGoal, "approach", now, target)
         updateProgress(humanoid, rootPart, approachGoal, target, now)
         return
     end
     state.navigationPhase = "combat"
+    state.movementOwner = "combat DPS"
     faceEnemy(humanoid, rootPart, targetRoot)
 
     if protectorApproach then
@@ -2540,6 +2571,7 @@ local function setRunning(running)
         state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
         -- A short party pause must not send the carry back to the first room.
         state.progressWatch, state.inaccessibleTargets, state.routeScanAt = nil, nil, nil
+        state.routeEdge, state.routeCost, state.movementOwner, state.mechanic = nil, 0, "idle", nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
         state.adaptiveTarget, state.targetStrategy = nil, "visible"
@@ -2653,9 +2685,11 @@ return {
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetAbilityInventory = abilities.SetInventory,
     AbilityProfile = FarmPlanner.profile,
-    SetLearningData = function(data) adaptive:load(data) end,
-    GetLearningData = function() return adaptive:export() end,
-    AdaptiveStatus = function() return adaptive:summary() end,
+    SetLearningData = function(data)
+        if type(data) == "table" and data.Combat then adaptive:load(data.Combat); navigation:load(data.Navigation) else adaptive:load(data) end
+    end,
+    GetLearningData = function() return { Combat = adaptive:export(), Navigation = navigation:export() } end,
+    AdaptiveStatus = function() local a, n = adaptive:summary(), navigation:summary(); return { observations = a.observations + n.observations, contexts = a.contexts + n.contexts } end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end

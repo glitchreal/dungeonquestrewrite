@@ -17,7 +17,8 @@ local world={FindFirstChild=function(_,name) if name=='dungeon' then return dung
 local state={routeAnchors={},routeAnchorIndex=1,kills=0}
 local source=read('src/CombatController.luau')
 local route=source:match('(local hasBlockingRay.-)\nlocal function isValidTarget')
-local globals=setmetatable({state=state,Workspace=world,Vector3={new=V},ROUTE_GUIDED_DUNGEONS={['Northern Lands']={reach=12,height=10,watchdog=12}},
+local navigation={score=function() return 0.5 end,observe=function() end}
+local globals=setmetatable({navigation=navigation,state=state,Workspace=world,Vector3={new=V},ROUTE_GUIDED_DUNGEONS={['Northern Lands']={reach=12,height=10,watchdog=12}},
     dungeonName=function() return 'Northern Lands' end},{__index=_G})
 local getGoal,refresh=assert(load(route..'\nhasBlockingRay=function() return false end\nreturn mapRouteGoal,refreshRouteAnchors','route','t',globals))()
 local root={Position=V(0,50,0),Parent={}}

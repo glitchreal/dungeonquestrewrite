@@ -780,6 +780,106 @@ end
 return AdaptivePolicy
 
 end)()
+local NavigationMemory = (function()
+-- Small, reversible navigation/boss memory adapted from the older controller.
+-- Live geometry always wins; this only changes tie breaking and bounded retries.
+local Memory = {}
+local VERSION, MAX_CONTEXTS, MAX_ACTIONS, MAX_SAMPLES = 1, 96, 12, 40
+local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+local function validKey(value) return type(value) == "string" and #value > 0 and #value <= 96 end
+function Memory.new()
+    local self = { version = VERSION, contexts = {}, total = 0 }
+    local function bucket(context)
+        if not validKey(context) then return nil end
+        local value = self.contexts[context]
+        if not value then
+            local count = 0; for _ in pairs(self.contexts) do count = count + 1 end
+            if count >= MAX_CONTEXTS then
+                local oldest, oldestAt
+                for key, entry in pairs(self.contexts) do
+                    if not oldestAt or (entry.lastAt or 0) < oldestAt then oldest, oldest, oldestAt = key, key, entry.lastAt or 0 end
+                end
+                if oldest then self.contexts[oldest] = nil end
+            end
+            value = { total = 0, lastAt = 0, actions = {} }
+            self.contexts[context] = value
+        end
+        return value
+    end
+    local function fade(entry, now)
+        local age = math.max(0, now - (entry.lastAt or now))
+        if age > 900 then entry.total = math.floor(entry.total * 0.5); entry.lastAt = now end
+        for action, sample in pairs(entry.actions) do
+            if now - (sample.at or now) > 1800 then entry.actions[action] = nil end
+        end
+    end
+    function self:score(context, action, now)
+        local entry = self.contexts[context]; if not entry then return 0.5 end
+        fade(entry, now or os.clock())
+        local sample = entry.actions[action]; if not sample then return 0.5 end
+        return clamp(sample.value or 0.5, 0.05, 0.95)
+    end
+    function self:choose(context, actions, now)
+        local best, bestScore
+        for _, action in ipairs(actions) do
+            local score = self:score(context, action, now)
+            if not bestScore or score > bestScore then best, bestScore = action, score end
+        end
+        return best or actions[1]
+    end
+    function self:observe(context, action, reward, now)
+        if not validKey(context) or type(action) ~= "string" or #action > 48 then return end
+        local entry = bucket(context); if not entry then return end
+        now, reward = now or os.clock(), clamp(tonumber(reward) or 0, -1, 1)
+        fade(entry, now)
+        local sample = entry.actions[action] or { count = 0, value = 0.5, at = now }
+        sample.count = math.min(MAX_SAMPLES, sample.count + 1)
+        local rate = 1 / math.max(4, sample.count)
+        sample.value = clamp(sample.value + rate * ((reward + 1) * 0.5 - sample.value), 0.05, 0.95)
+        sample.at = now; entry.actions[action] = sample
+        entry.total = math.min(MAX_SAMPLES * MAX_ACTIONS, entry.total + 1); entry.lastAt = now
+        self.total = math.min(MAX_CONTEXTS * MAX_SAMPLES, self.total + 1)
+        local count = 0; for _ in pairs(entry.actions) do count = count + 1 end
+        if count > MAX_ACTIONS then
+            local oldest, oldestAt
+            for key, value in pairs(entry.actions) do if not oldestAt or value.at < oldestAt then oldest, oldestAt = key, value.at end end
+            if oldest then entry.actions[oldest] = nil end
+        end
+    end
+    function self:load(data)
+        if type(data) ~= "table" or data.Version ~= VERSION or type(data.Contexts) ~= "table" then return end
+        self.contexts, self.total = {}, clamp(tonumber(data.Total) or 0, 0, MAX_CONTEXTS * MAX_SAMPLES)
+        for context, source in pairs(data.Contexts) do
+            if validKey(context) and type(source) == "table" and type(source.Actions) == "table" then
+                local entry = { total = clamp(tonumber(source.Total) or 0, 0, MAX_SAMPLES * MAX_ACTIONS), lastAt = tonumber(source.LastAt) or 0, actions = {} }
+                local count = 0
+                for action, value in pairs(source.Actions) do
+                    if type(action) == "string" and type(value) == "table" and count < MAX_ACTIONS then
+                        entry.actions[action] = { count = clamp(tonumber(value.Count) or 0, 0, MAX_SAMPLES), value = clamp(tonumber(value.Value) or 0.5, 0.05, 0.95), at = tonumber(value.At) or entry.lastAt }
+                        count = count + 1
+                    end
+                end
+                self.contexts[context] = entry
+            end
+        end
+    end
+    function self:export()
+        local result = { Version = VERSION, Total = self.total, Contexts = {} }
+        for context, entry in pairs(self.contexts) do
+            result.Contexts[context] = { Total = entry.total, LastAt = entry.lastAt, Actions = {} }
+            for action, sample in pairs(entry.actions) do result.Contexts[context].Actions[action] = { Count = sample.count, Value = sample.value, At = sample.at } end
+        end
+        return result
+    end
+    function self:summary()
+        local contexts = 0; for _ in pairs(self.contexts) do contexts = contexts + 1 end
+        return { observations = self.total, contexts = contexts }
+    end
+    return self
+end
+return Memory
+
+end)()
 local PartySync = (function()
 -- Same-workspace files are the fastest sync path and need no background process.
 -- The HTTP relay remains a fallback when executor instances isolate their files.
@@ -2087,9 +2187,14 @@ local state = {
     routeAnchorIndex = 1,
     adaptiveTarget = nil,
     targetStrategy = "visible",
+    routeEdge = nil,
+    routeCost = 0,
+    movementOwner = "idle",
+    mechanic = nil,
 }
 
 local adaptive = AdaptivePolicy.new()
+local navigation = NavigationMemory.new()
 
 -- Ring-buffer recorder: zone sightings, escapes, teleports, hits.
 -- Lets a later hit be explained from the previous ~60s of decisions.
@@ -2375,7 +2480,8 @@ local function mapRouteGoal(rootPart)
         if Vector3.new(delta.X, 0, delta.Z).Magnitude <= policy.reach and math.abs(delta.Y) <= policy.height
             and not hasBlockingRay(rootPart.Position, anchor.part.Position + Vector3.new(0, 2.5, 0), rootPart.Parent) then
             for passed = state.routeAnchorIndex, index do state.routePassed[state.routeAnchors[passed].key] = true end
-            state.routePassedOrder = anchor.order
+            navigation:observe("route|" .. tostring(state.routeDungeon), state.routeEdge or ("edge:" .. tostring(index)), 1, os.clock())
+            state.routeCost, state.routePassedOrder = 0.5, anchor.order
             state.routeAnchorIndex = index + 1
         end
     end
@@ -2384,7 +2490,12 @@ local function mapRouteGoal(rootPart)
         if not anchor then return nil end
         if not anchor.part.Parent or state.routePassed[anchor.key] then
             state.routeAnchorIndex = state.routeAnchorIndex + 1
-        else return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor end
+        else
+            local edge = "edge:" .. tostring(state.routeAnchorIndex) .. ">" .. tostring(anchor.order)
+            state.routeEdge = edge
+            state.routeCost = navigation:score("route|" .. tostring(state.routeDungeon), edge, os.clock())
+            return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
+        end
     end
 end
 
@@ -2529,6 +2640,7 @@ local function finishAdaptiveTarget(now, terminal)
     if now - (entry.startedAt or now) < 1.25 then reward = reward * 0.5 end
     adaptive:observe(entry.targetContext, entry.targetAction, reward)
     adaptive:observe(entry.rangeContext, entry.rangeAction, reward)
+    navigation:observe("spacing|" .. tostring(game.PlaceId) .. "|" .. kind, entry.rangeAction, reward, now)
     state.adaptiveTarget = nil
 end
 
@@ -2546,7 +2658,8 @@ local function beginAdaptiveTarget(target, humanoid, now)
         targetContext = adaptiveTargetContext() .. "|" .. kind,
         targetAction = state.targetStrategy or "visible",
         rangeContext = rangeContext,
-        rangeAction = adaptive:choose(rangeContext, RANGE_ACTIONS, "base"),
+        rangeAction = navigation:choose(rangeContext, RANGE_ACTIONS, now)
+            or adaptive:choose(rangeContext, RANGE_ACTIONS, "base"),
         startHealth = humanoid.Health,
         lastHealth = humanoid.Health,
         startDamage = state.damageEvents,
@@ -2834,6 +2947,8 @@ end
 
 local function followGoal(humanoid, rootPart, goal, mode, now, target)
     if not goal then return end
+    state.movementOwner = mode == "map-route" and "room navigation"
+        or mode == "approach" and "combat approach" or mode == "combat" and "combat DPS" or "recovery" and "safe recovery" or mode
     -- Flying targets bob up and down; a climb goal set during an upward bob
     -- goes stale when the target comes back down. Drop it instead of pacing
     -- between tiers.
@@ -3840,6 +3955,7 @@ end
 
 
 local function handleSafety(humanoid, rootPart, target, targetRoot, now)
+    state.movementOwner = "emergency hazard escape"
     if not CFG.AUTO_DODGE then
         state.escapeGoal, state.lastThreatPart, state.movementBlocked, state.retreating = nil, nil, false, false
         return false
@@ -4084,6 +4200,7 @@ local function progressWatchdog(rootPart, target, now, routeGoal, routeAnchor)
         state.inaccessibleTargets = state.inaccessibleTargets or setmetatable({}, { __mode = "k" })
         state.inaccessibleTargets[target] = now + 6
     end
+    if state.routeEdge then navigation:observe("route|" .. tostring(state.routeDungeon), state.routeEdge, -1, now) end
     state.lockedTarget, state.currentTarget, state.motionGoal, state.fallbackGoal = nil, nil, nil, nil
     state.lastTargetChoice, state.pathUpdateTime, state.routeFails = 0, 0, 0
     clearPath()
@@ -4102,6 +4219,15 @@ local function controllerTick()
     end
 
     local now = os.clock()
+    state.mechanic = nil
+    for _, zone in ipairs(state.activeZones) do
+        local name = tostring(zone.name or (zone.id and zone.id.Name) or ""):lower()
+        if name:find("beam", 1, true) then state.mechanic = "beam"
+        elseif name:find("orb", 1, true) then state.mechanic = "colored orb"
+        elseif name:find("slam", 1, true) or name:find("jump", 1, true) then state.mechanic = "jump slam"
+        elseif name:find("projectile", 1, true) or name:find("shot", 1, true) then state.mechanic = "projectile corridor" end
+        if state.mechanic then break end
+    end
     CFG.ATTACK_RANGE = CFG.SPELL_RANGE_OVERRIDE > 0 and CFG.SPELL_RANGE_OVERRIDE or 26
     if CFG.SMART_FARM then
         local snapshots = abilities.Snapshot(now)
@@ -4203,6 +4329,7 @@ local function controllerTick()
     refreshSafety(rootPart, now)
     if handleSafety(humanoid, rootPart, target, targetRoot, now) then
         state.navigationPhase = "evade"
+        state.movementOwner = "mandatory boss mechanic"
         if CFG.AUTO_ABILITIES and CFG.SMART_FARM then
             abilities.TryCast(now, CFG.SKILL_COOLDOWN, function(slot, snapshot)
                 return FarmPlanner.profile(snapshot).mode == "buff" and prepareSpell(slot, snapshot)
@@ -4347,13 +4474,17 @@ local function controllerTick()
             state.wanderGoal = nil
         end
         state.status = "Routing around obstacle to " .. target.Name
+        local elevated = targetRoot.Position.Y - rootPart.Position.Y > 8
+        local groundedTarget = groundPosition(Vector3.new(targetRoot.Position.X, rootPart.Position.Y, targetRoot.Position.Z), character, target)
         local approachGoal = protectorApproach or (protectorRear
-            and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target)) or targetRoot.Position
+            and groundPosition(targetRoot.Position - targetRoot.CFrame.LookVector * 16, character, target))
+            or (elevated and groundedTarget) or targetRoot.Position
         followGoal(humanoid, rootPart, approachGoal, "approach", now, target)
         updateProgress(humanoid, rootPart, approachGoal, target, now)
         return
     end
     state.navigationPhase = "combat"
+    state.movementOwner = "combat DPS"
     faceEnemy(humanoid, rootPart, targetRoot)
 
     if protectorApproach then
@@ -4474,6 +4605,7 @@ local function setRunning(running)
         state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
         -- A short party pause must not send the carry back to the first room.
         state.progressWatch, state.inaccessibleTargets, state.routeScanAt = nil, nil, nil
+        state.routeEdge, state.routeCost, state.movementOwner, state.mechanic = nil, 0, "idle", nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
         state.adaptiveTarget, state.targetStrategy = nil, "visible"
@@ -4587,9 +4719,11 @@ return {
     AbilityStatus = function() return abilities.Snapshot(os.clock()) end,
     SetAbilityInventory = abilities.SetInventory,
     AbilityProfile = FarmPlanner.profile,
-    SetLearningData = function(data) adaptive:load(data) end,
-    GetLearningData = function() return adaptive:export() end,
-    AdaptiveStatus = function() return adaptive:summary() end,
+    SetLearningData = function(data)
+        if type(data) == "table" and data.Combat then adaptive:load(data.Combat); navigation:load(data.Navigation) else adaptive:load(data) end
+    end,
+    GetLearningData = function() return { Combat = adaptive:export(), Navigation = navigation:export() } end,
+    AdaptiveStatus = function() local a, n = adaptive:summary(), navigation:summary(); return { observations = a.observations + n.observations, contexts = a.contexts + n.contexts } end,
     SetWaypoints = function(enabled)
         CFG.SHOW_WAYPOINTS = enabled
         if enabled then visualizeWaypoints(state.waypoints, state.currentWaypointIndex) else clearWaypointVisuals() end
