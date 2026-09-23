@@ -1272,8 +1272,10 @@ local function refreshSafety(rootPart, now)
                 local protectorSmash = smashBox and smashBox:IsA("BasePart") and smashBox.Size.Y == 150
                     and smashBox.Size.X == part.Size.X and smashBox.Size.Z == 10
                 local lineBox, lineName
-                local dungeonName = Workspace:FindFirstChild("dungeonName")
-                if part.Name == "precast" and dungeonName and dungeonName.Value == "Aquatic Temple" then
+                -- These templates are shared by several dungeons. The old
+                -- Aquatic Temple name gate caused Northern Lands Guardian
+                -- crisscross lanes to be treated as generic stale parts.
+                if part.Name == "precast" then
                     local hitbox = part.Parent:FindFirstChild("hitBox")
                     if hitbox and hitbox:IsA("BasePart") then
                         for _, template in ipairs(aquaticLineTemplates) do
@@ -1604,6 +1606,38 @@ local function threatIsSmash(threat)
         if zone.id == threat and zone.shape == "ProtectorSmash" then return true end
     end
     return false
+end
+
+local function orbCrystalGoal(rootPart, orbZone, target)
+    local crystals = Workspace:FindFirstChild("secondBossCrystals")
+    if not crystals or not orbZone then return nil end
+    local orbName = tostring(orbZone.name or (typeof(orbZone.id) == "Instance" and orbZone.id.Name) or ""):lower()
+    local orbColor = typeof(orbZone.id) == "Instance" and orbZone.id:IsA("BasePart") and orbZone.id.Color or nil
+    local best, bestScore
+    for _, crystal in ipairs(crystals:GetChildren()) do
+        local part = crystal:IsA("BasePart") and crystal or crystal:FindFirstChildWhichIsA("BasePart", true)
+        if part and part:IsDescendantOf(Workspace) then
+            local name = crystal.Name:lower()
+            local score = (name ~= "" and orbName:find(name, 1, true) and -10000 or 0)
+            if orbColor then
+                local colorDistance = math.abs(part.Color.R - orbColor.R)
+                    + math.abs(part.Color.G - orbColor.G) + math.abs(part.Color.B - orbColor.B)
+                score = score + colorDistance * 100
+            end
+            score = score + (part.Position - rootPart.Position).Magnitude
+            if not bestScore or score < bestScore then best, bestScore = part, score end
+        end
+    end
+    if not best then return nil end
+    local delta = rootPart.Position - best.Position
+    local flat = Vector3.new(delta.X, 0, delta.Z)
+    if flat.Magnitude < 0.1 then flat = Vector3.new(1, 0, 0) else flat = flat.Unit end
+    local goal = groundPosition(best.Position + flat * 4, rootPart.Parent, target)
+    if (goal - rootPart.Position).Magnitude > 80 then return nil end
+    if ThreatGeometry.risk(state.activeZones, goal, CFG.HAZARD_MARGIN) > 0 then return nil end
+    if not ThreatGeometry.segmentSafe(state.activeZones, rootPart.Position, goal, CFG.HAZARD_MARGIN) then return nil end
+    if not walkingSegmentClear(rootPart, goal, target) then return nil end
+    return goal, best
 end
 
 local function canTeleportDodge(now, distance, threat)
@@ -1967,6 +2001,28 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     elseif clearance >= CFG.RETREAT_RELEASE_MARGIN then state.retreating = false end
     local contactThreat = meleeThreat(rootPart)
     local contactDistance = (targetRoot.Position - rootPart.Position).Magnitude
+    -- Bob's colored-orb phase is an objective: touching the matching crystal
+    -- clears the orb. Reserve movement for that objective when a live orb
+    -- telegraph exists and the approach is already safe; ordinary attacks
+    -- still preempt it through the normal hazard planner.
+    local orbZone
+    for _, activeZone in ipairs(state.activeZones) do
+        local activeName = tostring(activeZone.name or (typeof(activeZone.id) == "Instance" and activeZone.id.Name) or ""):lower()
+        if activeName:find("orb", 1, true) then orbZone = activeZone; break end
+    end
+    if orbZone then
+        local crystalGoal, crystal = orbCrystalGoal(rootPart, orbZone, target)
+        if crystalGoal then
+            clearPath()
+            state.escapeGoal, state.escapeUntil = crystalGoal, now + 1.0
+            state.escapeMargin, state.escapeStartRisk = CFG.HAZARD_MARGIN, risk
+            state.escapeClear, state.lastEscapeCheck = true, now
+            state.escapeReason = "Clearing colored orb at " .. crystal.Name
+            state.status, state.movementOwner = state.escapeReason, "orb objective"
+            issueMove(humanoid, crystalGoal, "orb-objective", now)
+            return true
+        end
+    end
     -- Once a melee escape is validated, keep that short goal for its lease.
     -- Replanning while the same enemy is still touching the body used to
     -- clear the path every tick and caused rapid retreat-direction flips.
