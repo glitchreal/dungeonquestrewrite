@@ -92,3 +92,12 @@ Final local verification: `lua build.lua` generated both bundles; Luau compilati
 passed for all source modules and both runtime bundles. All 17 focused lifecycle
 checks, profile/boost checks, navigation fixtures, and 3 relay tests passed.
 `git diff --check` passed. These are implementation checks, not a pre-commit gate.
+
+
+## Follow-up screenshot fix
+
+The screenshot showed a Carry account displaying `Party ready; start delay 147 / 3s`.
+Only Host owns the start action, so that counter was misleading on Carry/Alt and
+made auto-farm appear stuck. Carry/Alt now immediately show `Waiting for Host to
+start`; the delay counter is Host-only and its displayed elapsed value is capped at
+the configured delay.

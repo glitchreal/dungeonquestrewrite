@@ -558,9 +558,15 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         if not started then
             stop()
             if config.RequireScriptsReady and not scriptsReady then state.readyAt = nil; state.status = sync and sync.status or "Sync transport unavailable"; return end
+            if config.Role ~= "Host" then
+                state.readyAt = nil
+                state.status = "Waiting for Host to start"
+                return
+            end
             state.readyAt = state.readyAt or now
-            state.status = "Party ready; start delay " .. string.format("%.1f / %.1f", now - state.readyAt, config.StartDelay)
-            if config.Role == "Host" and config.LevelKaitun and now - state.readyAt >= config.StartDelay
+            local elapsed = math.max(0, now - state.readyAt)
+            state.status = "Party ready; start delay " .. string.format("%.1f / %.1f", math.min(elapsed, config.StartDelay), config.StartDelay)
+            if config.LevelKaitun and elapsed >= config.StartDelay
                 and due("start", 5, now) and active() then
                 state.status = "Starting dungeon"; Adapter.call("changeStartValue")
             end
