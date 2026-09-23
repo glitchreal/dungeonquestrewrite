@@ -94,6 +94,26 @@ function Logic.sameDungeon(a, b)
     return a and b and a.Dungeon == b.Dungeon and a.Difficulty == b.Difficulty
 end
 
+-- Missing metadata is not proof that a better dungeon unlocked.
+function Logic.shouldProgress(chosen, current, provisioningChanged)
+    if not chosen or not current or not current.Dungeon or not current.Difficulty then return false end
+    if Logic.sameDungeon(chosen, current) then return false end
+    if provisioningChanged then return true end
+    local required = current.levelReq
+        or requirements[current.Dungeon] and requirements[current.Dungeon][current.Difficulty]
+    return required ~= nil and chosen.levelReq > required
+end
+
+function Logic.validCommand(command, hostId, carryId, jobId, placeId, now, hostAbsent)
+    return type(command) == "table" and command.version == 2
+        and type(command.id) == "string" and type(command.reason) == "string"
+        and command.jobId == jobId and command.placeId == placeId
+        and (command.authorId == hostId or command.authorId == carryId and hostAbsent and command.phase == "RECOVERING")
+        and type(command.at) == "number" and type(command.expiresAt) == "number"
+        and command.at <= now + 5 and command.expiresAt > now and command.expiresAt - command.at <= 90
+        and (command.phase == "REPLAYING" or command.phase == "PROGRESSION_RETURN" or command.phase == "RECOVERING")
+end
+
 -- Protect every equipped ability slot, including the game's q2/e2 slots.
 function Logic.isEquipped(item)
     if type(item.equipped) == "table" then

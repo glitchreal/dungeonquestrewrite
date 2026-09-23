@@ -1,6 +1,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { transitionFor } from './worker.mjs';
 
 export class LocalRelay {
   constructor(token, now = Date.now) {
@@ -25,15 +26,16 @@ export class LocalRelay {
     room.members.set(data.userId, {
       userId: data.userId, jobId: data.jobId, placeId: data.placeId, mode: data.mode,
       enabled: data.enabled, ready: data.ready, at: now,
-      healCount: data.healCount,
+      healCount: data.healCount, phase: data.phase, dungeon: data.dungeon,
     });
     if (data.regroup && data.userId === data.hostId && data.mode === 'Dungeon' && data.enabled) {
       room.command = { jobId: data.jobId, reason: data.regroup, expiresAt: now + 30000 };
     }
-    if (room.command && room.command.expiresAt <= now) room.command = null;
+    room.command = transitionFor(data, room.members, room.command, now);
+    if (room.command && room.command.expiresAt * (room.command.version === 2 ? 1000 : 1) <= now) room.command = null;
     return { protocol: 1, members: [...room.members.values()].map(({ at, ...member }) => ({
       ...member, age: (now - at) / 1000,
-    })), command: room.command && { jobId: room.command.jobId, reason: room.command.reason } };
+    })), command: room.command && (room.command.version === 2 ? room.command : { jobId: room.command.jobId, reason: room.command.reason }) };
   }
 }
 

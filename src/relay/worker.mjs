@@ -11,7 +11,29 @@ export function validate(data) {
       || typeof data.ready !== 'boolean' || typeof data.enabled !== 'boolean'
       || (data.healCount !== undefined && (!Number.isInteger(data.healCount) || data.healCount < 0 || data.healCount > 100))
       || (data.regroup !== undefined && (typeof data.regroup !== 'string' || data.regroup.length > 160))) return false;
+  if (data.phase !== undefined && !phases.has(data.phase)) return false;
+  if (data.transition !== undefined && (!data.transition || typeof data.transition !== 'object')) return false;
   return true;
+}
+
+const phases = new Set(['ASSEMBLING', 'PRE_START', 'RUNNING', 'REWARDS_SETTLING', 'REPLAYING',
+  'PROGRESSION_RETURN', 'RECOVERING', 'LOBBY_REFORMING', 'TELEPORTING']);
+export function transitionFor(data, members, previous, now) {
+  const t = data.transition;
+  const host = members.get(data.hostId);
+  const hostAbsent = !host || now - host.at > 35000;
+  if (!t || t.version !== 2 || typeof t.id !== 'string' || t.id.length > 100
+      || t.authorId !== data.userId || t.jobId !== data.jobId || t.placeId !== data.placeId
+      || !['REPLAYING', 'PROGRESSION_RETURN', 'RECOVERING'].includes(t.phase)
+      || typeof t.reason !== 'string' || t.reason.length > 200
+      || !Number.isFinite(t.at) || !Number.isFinite(t.expiresAt)
+      || t.at * 1000 > now + 5000 || t.expiresAt * 1000 <= now
+      || t.expiresAt - t.at > 90 || t.expiresAt <= t.at
+      || data.mode !== 'Dungeon' || !data.enabled
+      || !(data.userId === data.hostId || data.userId === data.carryId && hostAbsent && t.phase === 'RECOVERING')) return previous;
+  // Duplicate/reordered writes never renew an epoch or overwrite a newer decision.
+  if (previous && (previous.id === t.id || previous.at > t.at)) return previous;
+  return { ...t };
 }
 
 export default {
@@ -59,7 +81,7 @@ export class Party {
     this.members.set(data.userId, {
       userId: data.userId, jobId: data.jobId, placeId: data.placeId, mode: data.mode,
       enabled: data.enabled, ready: data.ready, at: now,
-      healCount: data.healCount,
+      healCount: data.healCount, phase: data.phase, dungeon: data.dungeon,
     });
     // Only the configured host announces a regroup. It applies solely to the old
     // dungeon job, so a delayed message cannot eject a newly assembled party.
@@ -67,9 +89,11 @@ export class Party {
       this.command = { jobId: data.jobId, reason: data.regroup, expiresAt: now + 180000 };
       await this.ctx.storage.put('command', this.command);
     }
-    const command = this.command && this.command.expiresAt > now ? this.command : null;
+    const next = transitionFor(data, this.members, this.command, now);
+    if (next !== this.command) { this.command = next; await this.ctx.storage.put('command', next); }
+    const command = this.command && this.command.expiresAt * (this.command.version === 2 ? 1000 : 1) > now ? this.command : null;
     return json({ protocol: 1, members: [...this.members.values()].map(({ at, ...member }) => ({
       ...member, age: (now - at) / 1000,
-    })), command: command ? { jobId: command.jobId, reason: command.reason } : null });
+    })), command: command ? (command.version === 2 ? command : { jobId: command.jobId, reason: command.reason }) : null });
   }
 }

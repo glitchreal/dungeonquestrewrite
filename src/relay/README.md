@@ -47,8 +47,8 @@ by Roblox. Rotating the secret requires updating every account.
 Readiness lives in memory and expires after 35 seconds; eviction causes a safe
 wait for fresh reports. Regroup messages survive object eviction in storage and
 expire after three minutes. No timers keep the object awake. No account profiles,
-credentials, or arbitrary commands/code are exchanged. Relay outages pause synced
-starts/farming; host automatic regroup waits for acknowledgment. Disabling sync or
+credentials, or arbitrary commands/code are exchanged. Relay outages gate starts only when RequireScriptsReady is enabled; running combat
+uses player presence. Transition announcements have a bounded acknowledgment wait. Disabling sync or
 the manual Return to lobby action remains available in the hub.
 
 ## Local verification
@@ -56,3 +56,10 @@ the manual Return to lobby action remains available in the hub.
 Create an ignored `.dev.vars` file containing `RELAY_TOKEN=<test key>` and run
 `npm run dev`. `npm test` checks heartbeat expiry, regroup authority, old-job scope,
 and eviction. The production client requires HTTPS; local HTTP is for relay tests.
+
+Phase/epoch clients require this version of the relay. Heartbeats include `phase`
+and dungeon context; `transition` carries a version-2 fixed-expiry command. The
+relay validates authority, job/place scope, expiry, and ordering. Reposting an ID
+does not renew expiry. Legacy regroup payloads remain compatible with old clients,
+but new clients ignore legacy commands. Restart/redeploy existing relay instances
+when installing these runtime bundles. No relay was deployed by this change.

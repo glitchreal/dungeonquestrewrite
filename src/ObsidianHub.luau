@@ -9,11 +9,11 @@ env.DQRewriteResume = nil
 if env.DungeonQuestObsidian then env.DungeonQuestObsidian.Unload() end
 local configPath = "DungeonQuestRewrite-" .. player.UserId .. ".json"
 local C = {
-    Enabled = false, Role = "Carry", Host = "", Carry = "", Alts = "",
+    Enabled = false, AutoStartRole = false, AutoBuyBoosts = false, Role = "Carry", Host = "", Carry = "", Alts = "",
     AutoJoin = true, AutoAccept = true, Hardcore = false, Whitelist = true,
     LevelKaitun = true, AutoBest = true, AutoSwitch = true, ProvisionHeals = true,
     AutoHealer = false, AutoSell = false, KeepItems = "", KeepLegendary = true, AutoSkillPoints = false, UpgradeStat = "Stamina",
-    SyncEnabled = false, SyncURL = "", SyncKey = "",
+    SyncEnabled = false, RequireScriptsReady = false, SyncURL = "", SyncKey = "",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
     Distance = 20, SpellRange = 26, AutoDodge = true, AdaptiveCombat = true,
@@ -26,7 +26,7 @@ local function readShared(path)
     local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
     if ok and type(data) == "table" and data.Version == 1 then return data end
 end
-local accountOnly = { SyncEnabled = true, SyncURL = true, SyncKey = true }
+local accountOnly = { Enabled = true, Role = true, Host = true, Carry = true, Alts = true, SyncURL = true, SyncKey = true }
 local function applyValues(values)
     for key, value in pairs(type(values) == "table" and values or {}) do
         if not accountOnly[key] and defaults[key] ~= nil and type(value) == type(defaults[key]) then C[key] = value end
@@ -47,14 +47,16 @@ if env.autoloadconfig ~= false then
         if type(saved.MenuKey) == "string" then menuKey = saved.MenuKey end
     end
 end
--- A teleport snapshot belongs to this account and takes precedence over shared profiles.
-if env.autoloadconfig ~= false and type(resume) ~= "table" then
+-- Role profiles own normal settings on every execute, including teleports.
+local continuationEnabled = type(resume) == "table" and C.Enabled
+if env.autoloadconfig ~= false then
     local shared = readShared(partyPath)
     local party = shared and type(shared.Party) == "table" and shared.Party or table.clone(C)
     local detected = Logic.accountRole(party, player.Name, player.UserId)
     if detected then
         local profile = readShared(profilePath(detected))
         if profile and type(profile.Config) == "table" then
+            applyValues(defaults)
             applyValues(profile.Config)
             if type(profile.MenuKey) == "string" then menuKey = profile.MenuKey end
         elseif C.Role ~= detected then
@@ -66,7 +68,10 @@ if env.autoloadconfig ~= false and type(resume) ~= "table" then
         if type(party[key]) == "string" then C[key] = party[key] end
     end
 end
--- Setup loaders can enable shared files alone or add a relay fallback.
+if C.AutoStartRole then C.Enabled = true
+elseif type(resume) == "table" then C.Enabled = continuationEnabled == true
+else C.Enabled = false end
+-- Setup loaders configure transport only; role auto-start and readiness are independent.
 local syncSetup = env.DQRewriteSync
 if type(syncSetup) == "table" and (syncSetup.Files == true
     or type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string") then
@@ -92,7 +97,7 @@ Library.Scheme.AccentColor = Color3.fromRGB(63, 205, 134)
 local controller = createController()
 if controller.SetLearningData then controller.SetLearningData(runtime.AdaptiveCombat) end
 local alive, hooks, controls, errors = true, {}, {}, {}
-local coordinator, partySync
+local coordinator, partySync, boosts
 local editingParty = false
 local partyInputs = {}
 local previousFPS = type(getfpscap) == "function" and getfpscap() or nil
@@ -222,6 +227,7 @@ local function slider(group, key, text, min, max)
     controls[key] = control
 end
 local automation = partyTab:AddLeftGroupbox("Automation")
+toggle(automation, "AutoStartRole", "Auto start role automation on execute")
 toggle(automation, "Enabled", "Enable role automation", nil, "Starts the selected Carry, Host, or Alt role. Choose Host to create dungeons.")
 automation:AddLabel("Select your account role and fill in the party below. Host creates dungeons; carry and alts request the host.", true)
 local roleAutomation = roleTab:AddLeftGroupbox("Automation")
@@ -237,11 +243,12 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
 local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
-toggle(syncGroup, "SyncEnabled", "Require selected scripts ready", nil, "Uses shared executor files automatically. A configured relay is only a fallback when client workspaces are isolated.")
+toggle(syncGroup, "SyncEnabled", "Enable cross-client sync", nil, "Exchanges party phases and heartbeats. Does not enable or disable local Carry combat.")
+toggle(syncGroup, "RequireScriptsReady", "Require selected scripts ready before start", nil, "Waits for every selected heartbeat before starting. Turn off to use player presence when transport is unavailable.")
 input(syncGroup, "SyncURL", "Optional relay fallback URL")
 input(syncGroup, "SyncKey", "Private relay key")
 syncGroup:AddLabel("Same-device clients first try heartbeat files in the executor workspace. No command or local server is needed when those files are shared.", true)
-local syncLabel = syncGroup:AddLabel("Sync off", true)
+local syncLabel = syncGroup:AddLabel("Sync: checking transport", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
@@ -262,9 +269,9 @@ slider(carry, "SpellRange", "Spell range fallback", 8, 100)
 toggle(carry, "AutoDodge", "Pathfinding hazard avoidance")
 toggle(carry, "AdaptiveCombat", "Adaptive combat policy", nil, "Learns target priority and combat spacing from local health, kill, and damage outcomes. The model stays on this account and falls back to the safe baseline until it has evidence.")
 local join = roleTab:AddLeftGroupbox("Carry and alt")
-toggle(join, "AutoJoin", "Send join requests to host")
+toggle(join, "AutoJoin", "Auto join Host")
 slider(join, "JoinInterval", "Join request interval (seconds)", 5, 60)
-toggle(join, "AutoSwitch", "Switch to best party dungeon", nil, "After a run, selects for the lowest host/alt level. Unequal XP no longer prevents switching.")
+join:AddLabel("Host Auto Best decides progression for the whole party. Carry and Alts follow the Host transition.", true)
 local host = roleTab:AddRightGroupbox("2 · Host")
 toggle(host, "AutoBest", "Create and join best eligible dungeon", nil, "Runs when this account is set to Host and role automation is enabled.")
 toggle(host, "AutoAccept", "Accept selected accounts only")
@@ -273,6 +280,10 @@ local support = roleTab:AddRightGroupbox("3 · Host and Alt support")
 toggle(support, "AutoHealer", "Healer loadout + Universal Heal", nil, "On Host or Alt, equips the strongest eligible mage weapon, tank helmet/chest, and up to two Universal Heals. Alternates heals when the party needs health.")
 toggle(support, "AutoSkillPoints", "Auto allocate skill points")
 dropdown(support, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
+local boostGroup = settingsTab:AddRightGroupbox("Boosts")
+toggle(boostGroup, "AutoBuyBoosts", "Auto buy boosts with gold", nil, "x2 Gold, +1 Drop, VIP, then XP 1h/2h/4h. Server prices and daily allowances are checked. Never spends Robux or gems.")
+local boostLabel = boostGroup:AddLabel("Boosts: auto buy off", true)
+boostGroup:AddLabel("Premium or unsupported offers must be purchased manually in the game's shop.", true)
 local inventory = settingsTab:AddLeftGroupbox("All account types")
 toggle(inventory, "AutoSell", "Auto sell all rarities", nil, "Works without role automation or party setup. Keeps two Universal Heals, equipped/locked/favorite items, and armor selected for the healer loadout.")
 toggle(inventory, "KeepLegendary", "Keep legendary items", nil, "Excludes every legendary weapon, helmet, chest, and ability from Auto Sell. Saved per account; enabled by default.")
@@ -314,14 +325,15 @@ menu:AddButton({ Text = "Return to lobby", Func = function()
 end })
 menu:AddButton({ Text = "Unload", Func = unload })
 partySync = PartySync.new(C, MODE, function() return alive end)
+boosts = BoostManager.new(C, runtime, function() return alive end)
 coordinator = Roles.new(C, runtime, MODE, controller, save, function() return alive end, partySync)
 env.DungeonQuestObsidian = { Config = C, Runtime = runtime, Controller = controller, Coordinator = coordinator,
-    Library = Library, Sync = partySync, Unload = unload, Errors = errors, Mode = MODE }
+    Library = Library, Sync = partySync, Boosts = boosts, Unload = unload, Errors = errors, Mode = MODE }
 local teleportQueued = false
 connect(player.OnTeleport, function(state)
     if state == Enum.TeleportState.Failed then teleportQueued = false; coordinator.TeleportFailed(); return end
     if state ~= Enum.TeleportState.Started then return end
-    coordinator.Stop(); save()
+    coordinator.TeleportStarted(); save()
     if env.autoexecute == false or teleportQueued or type(queueTeleport) ~= "function" then return end
     local url = env.DQObsidianLoaderURL or "https://raw.githubusercontent.com/glitchreal/dungeonquestrewrite/main/main.luau"
     local queued = string.format("getgenv().autoexecute=true\ngetgenv().autoloadconfig=%s\ngetgenv().DQRewriteResume=game:GetService('HttpService'):JSONDecode(%q)\nassert(loadstring(game:HttpGet(%q)))()",
@@ -365,10 +377,12 @@ task.spawn(function()
             coordinator.status = "Blocked: " .. reason:gsub("^.-:%d+: ", "")
         else errors.Automation = nil end
         saveLabel:SetText(errors.Save or errors.Profile or ("Profile: " .. C.Role .. " | Account: " .. player.Name))
+        boosts.Tick(os.clock())
+        boostLabel:SetText(boosts.status)
         syncLabel:SetText(partySync.status)
         roleStatusLabel:SetText(C.Role .. " · " .. coordinator.status)
         sellLabel:SetText(coordinator.sellStatus)
-        statusLabel:SetText(C.Role .. " · " .. coordinator.status)
+        statusLabel:SetText(C.Role .. " · " .. coordinator.phase .. " · " .. coordinator.status)
         partyLabel:SetText(coordinator.party)
         levelLabel:SetText("Level: " .. tostring(Adapter.level() or "loading") .. " | " .. controller.State.status)
         errorLabel:SetText(errors.Automation or errors.Save or "")

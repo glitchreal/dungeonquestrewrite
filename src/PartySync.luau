@@ -21,9 +21,9 @@ end
 function PartySync.new(config, mode, isAlive)
     local Http = game:GetService("HttpService")
     local player = game:GetService("Players").LocalPlayer
-    local sync = { status = "Sync off" }
+    local sync = { status = "Sync disabled: using presence-only coordination" }
     local context, response, receivedAt, pending, acknowledged, lastAttempt = nil, nil, nil, nil, false, -math.huge
-    local generation = 0
+    local generation, relayBusy = 0, false
     local files = {
         available = type(writefile) == "function" and type(readfile) == "function"
             and type(isfile) == "function" and type(makefolder) == "function",
@@ -49,8 +49,8 @@ function PartySync.new(config, mode, isAlive)
         return pcall(makefolder, path)
     end
     local function readJSON(path)
-        if not files.available or not path or not isfile(path) then return nil end
-        local ok, value = pcall(function() return Http:JSONDecode(readfile(path)) end)
+        if not files.available or not path then return nil end
+        local ok, value = pcall(function() return isfile(path) and Http:JSONDecode(readfile(path)) or nil end)
         return ok and type(value) == "table" and value or nil
     end
     local function writeJSON(path, value)
@@ -79,7 +79,7 @@ function PartySync.new(config, mode, isAlive)
         writeJSON(heartbeatPath(player.UserId), {
             version = 1, userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
             enabled = config.Enabled, ready = config.Enabled and context.ready and now - context.at < 2,
-            healCount = context.healCount,
+            healCount = context.healCount, phase = context.phase, dungeon = context.dungeon,
             at = wallTime(),
         })
     end
@@ -118,40 +118,68 @@ function PartySync.new(config, mode, isAlive)
             and member.jobId == game.JobId and member.placeId == game.PlaceId
     end
 
-    function sync.Update(roster, host, carry, ready, healCount)
+    function sync.Update(roster, host, carry, ready, healCount, phase, dungeon)
         reset()
         local ids = {}
         for _, account in ipairs(roster) do table.insert(ids, account.id) end
         context = { roster = ids, hostId = host.id, carryId = carry.id, ready = ready,
-            healCount = tonumber(healCount), at = os.clock() }
+            healCount = tonumber(healCount), phase = phase, dungeon = dungeon, at = os.clock() }
         if not files.room then setupRoom(ids, host.id, carry.id) end
     end
     function sync.Pause()
         if context then context.ready = false end
         files.lastWrite = -math.huge
     end
-    function sync.Regroup(reason)
-        reset()
-        if not config.SyncEnabled or config.Role ~= "Host" then return true end
-        if files.shared and writeJSON(commandPath(), {
-            version = 1, jobId = game.JobId, reason = reason, at = wallTime(),
-        }) then return true end
-        if not pending then pending = reason; acknowledged = false; lastAttempt = -math.huge end
-        return acknowledged
+    function sync.SetPhase(phase, dungeon)
+        if context then
+            context.phase, context.dungeon = phase, dungeon or context.dungeon
+            files.lastWrite = -math.huge
+            if config.SyncEnabled then writeHeartbeat(os.clock()) end
+        end
     end
-    function sync.Command()
+    function sync.Member(id)
         reset()
         if not config.SyncEnabled then return nil end
-        local command = readJSON(commandPath())
-        if fresh(command, 30) and command.jobId == game.JobId and type(command.reason) == "string" then
-            return command.reason
-        end
-        local responseLimit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 3 or 20
-        if response and receivedAt and os.clock() - receivedAt <= responseLimit then
-            command = response.command
-            if type(command) == "table" and command.jobId == game.JobId and type(command.reason) == "string" then
-                return command.reason
+        local member = readJSON(heartbeatPath(id))
+        if fresh(member, 3) and member.userId == id then return member end
+        local now = os.clock()
+        local limit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 5 or 35
+        if response and receivedAt and now - receivedAt <= limit then
+            for _, entry in ipairs(response.members) do
+                if entry.userId == id and type(entry.age) == "number" and entry.age + now - receivedAt <= limit then
+                    return entry
+                end
             end
+        end
+    end
+    function sync.NewCommand(phase, reason)
+        local now = wallTime()
+        return { version = 2, id = Http:GenerateGUID(false), authorId = player.UserId,
+            jobId = game.JobId, placeId = game.PlaceId, dungeon = context and context.dungeon,
+            phase = phase, reason = reason, at = now, expiresAt = now + 90 }
+    end
+    function sync.Announce(command)
+        reset()
+        if not config.SyncEnabled then return true end
+        if not pending or pending.id ~= command.id then
+            pending, acknowledged, lastAttempt = command, false, -math.huge
+        end
+        -- Write before departure even if not every script has been observed yet.
+        if writeJSON(commandPath(), command) and files.shared then return true end
+        return acknowledged
+    end
+    function sync.Command(hostAbsent)
+        reset()
+        if not config.SyncEnabled or not context then return nil end
+        local function valid(command)
+            return Logic.validCommand(command, context.hostId, context.carryId,
+                game.JobId, game.PlaceId, wallTime(), hostAbsent)
+        end
+        local command = readJSON(commandPath())
+        if valid(command) then return command end
+        local responseLimit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 3 or 20
+        if response and receivedAt and os.clock() - receivedAt <= responseLimit and valid(response.command) then
+            return response.command
         end
     end
     function sync.HealCounts(roster)
@@ -177,22 +205,26 @@ function PartySync.new(config, mode, isAlive)
     end
     function sync.Ready(roster)
         reset()
-        if not config.SyncEnabled then sync.status = "Sync off"; return true end
-        local ready, missing = fileReadiness(roster)
-        if ready then sync.status = "File sync: all scripts ready"; return true end
-        if files.shared then
-            sync.status = "File sync waiting: " .. table.concat(missing, ", ")
-            return false
+        if not config.SyncEnabled then
+            sync.status = config.RequireScriptsReady and "Sync disabled: enable sync to require selected scripts" or "Sync disabled: using presence-only coordination"
+            return not config.RequireScriptsReady
         end
+        local ready, missing = fileReadiness(roster)
+        if ready then sync.status = "Sync healthy: file transport"; return true end
         local relayReady, relayMissing = relayReadiness(roster)
-        if relayReady then sync.status = "Relay sync: all scripts ready"; return true end
-        local waiting = missing or relayMissing
-        if files.available then
-            sync.status = waiting and ("Looking for shared files: " .. table.concat(waiting, ", ")) or "Looking for shared executor workspace"
+        if relayReady then sync.status = "Sync healthy: relay fallback"; return true end
+        local waiting = table.concat(relayMissing or missing or {}, ", ")
+        if files.shared then
+            sync.status = "Sync: heartbeat stale/not ready: " .. waiting
         elseif relayMissing then
-            sync.status = "Relay waiting: " .. table.concat(relayMissing, ", ")
+            sync.status = "Sync: waiting for " .. waiting .. " heartbeat (relay)"
         else
-            sync.status = "Sync unavailable: executor files are isolated and relay is offline"
+            sync.status = "Sync unavailable: shared files unconfirmed (possibly isolated); relay unavailable"
+                .. (waiting ~= "" and ("; waiting for " .. waiting .. " heartbeat") or "")
+        end
+        if not config.RequireScriptsReady then
+            sync.status = sync.status .. "; presence-only fallback active"
+            return true
         end
         return false
     end
@@ -201,13 +233,14 @@ function PartySync.new(config, mode, isAlive)
         while isAlive() do
             reset()
             local now = os.clock()
-            if not config.SyncEnabled then sync.status = "Sync off"
+            if not config.SyncEnabled then
+                sync.status = config.RequireScriptsReady and "Sync disabled: selected scripts required" or "Sync disabled: using presence-only coordination"
             elseif context then
                 writeHeartbeat(now)
                 local url = config.SyncURL:gsub("/+$", "")
                 local kind = relayKind(url)
                 local interval = kind == "local" and 0.5 or 10
-                if kind and #config.SyncKey >= 32 and now - lastAttempt >= interval then
+                if not relayBusy and kind and #config.SyncKey >= 32 and now - lastAttempt >= interval then
                     lastAttempt = now
                     local request = request or http_request or (syn and syn.request)
                     if type(request) == "function" then
@@ -218,27 +251,31 @@ function PartySync.new(config, mode, isAlive)
                             roster = context.roster, hostId = context.hostId, carryId = context.carryId,
                             userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
                             enabled = config.Enabled, ready = config.Enabled and context.ready and not pending and now - context.at < 5,
-                            healCount = context.healCount,
-                            regroup = pending,
+                            healCount = context.healCount, phase = context.phase, dungeon = context.dungeon,
+                            transition = pending,
                         }
-                        local ok, result = pcall(function()
-                            local timeout = kind == "local" and 2 or 8
-                            local reply = request({ Url = url .. "/sync", Method = "POST", Timeout = timeout,
-                                Headers = { ["Content-Type"] = "application/json", Authorization = "Bearer " .. config.SyncKey },
-                                Body = Http:JSONEncode(payload) })
-                            assert(reply and reply.StatusCode == 200, "Relay HTTP " .. tostring(reply and reply.StatusCode))
-                            local decoded = Http:JSONDecode(reply.Body)
-                            assert(decoded.protocol == 1 and type(decoded.members) == "table", "Invalid relay response")
-                            return decoded
+                        relayBusy = true
+                        task.spawn(function()
+                            local ok, result = pcall(function()
+                                local timeout = kind == "local" and 2 or 8
+                                local reply = request({ Url = url .. "/sync", Method = "POST", Timeout = timeout,
+                                    Headers = { ["Content-Type"] = "application/json", Authorization = "Bearer " .. config.SyncKey },
+                                    Body = Http:JSONEncode(payload) })
+                                assert(reply and reply.StatusCode == 200, "Relay HTTP " .. tostring(reply and reply.StatusCode))
+                                local decoded = Http:JSONDecode(reply.Body)
+                                assert(decoded.protocol == 1 and type(decoded.members) == "table", "Invalid relay response")
+                                return decoded
+                            end)
+                            relayBusy = false
+                            if not isAlive() then return end
+                            reset()
+                            if generation == sentGeneration and signature() == sentSignature then
+                                if ok and os.clock() - sentAt <= (kind == "local" and 2 or 8) then
+                                    response, receivedAt = result, sentAt
+                                    if pending and type(result.command) == "table" and pending.id == result.command.id then acknowledged = true end
+                                else response, receivedAt = nil, nil end
+                            end
                         end)
-                        if not isAlive() then return end
-                        reset()
-                        if generation == sentGeneration and signature() == sentSignature then
-                            if ok and os.clock() - sentAt <= (kind == "local" and 2 or 8) then
-                                response, receivedAt = result, sentAt
-                                if pending and type(result.command) == "table" and result.command.jobId == game.JobId then acknowledged = true end
-                            else response, receivedAt = nil, nil end
-                        end
                     end
                 end
             else sync.status = "Sync: waiting for valid party setup" end

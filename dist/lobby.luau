@@ -101,6 +101,26 @@ function Logic.sameDungeon(a, b)
     return a and b and a.Dungeon == b.Dungeon and a.Difficulty == b.Difficulty
 end
 
+-- Missing metadata is not proof that a better dungeon unlocked.
+function Logic.shouldProgress(chosen, current, provisioningChanged)
+    if not chosen or not current or not current.Dungeon or not current.Difficulty then return false end
+    if Logic.sameDungeon(chosen, current) then return false end
+    if provisioningChanged then return true end
+    local required = current.levelReq
+        or requirements[current.Dungeon] and requirements[current.Dungeon][current.Difficulty]
+    return required ~= nil and chosen.levelReq > required
+end
+
+function Logic.validCommand(command, hostId, carryId, jobId, placeId, now, hostAbsent)
+    return type(command) == "table" and command.version == 2
+        and type(command.id) == "string" and type(command.reason) == "string"
+        and command.jobId == jobId and command.placeId == placeId
+        and (command.authorId == hostId or command.authorId == carryId and hostAbsent and command.phase == "RECOVERING")
+        and type(command.at) == "number" and type(command.expiresAt) == "number"
+        and command.at <= now + 5 and command.expiresAt > now and command.expiresAt - command.at <= 90
+        and (command.phase == "REPLAYING" or command.phase == "PROGRESSION_RETURN" or command.phase == "RECOVERING")
+end
+
 -- Protect every equipped ability slot, including the game's q2/e2 slots.
 function Logic.isEquipped(item)
     if type(item.equipped) == "table" then
@@ -329,10 +349,10 @@ function Adapter.members(roster)
     return members
 end
 
-function Adapter.findLobby()
+function Adapter.findLobby(name)
     local games = workspace:FindFirstChild("games")
     local list = games and games:FindFirstChild("inLobby")
-    if list then return list:FindFirstChild(player.Name) end
+    if list then return list:FindFirstChild(name or player.Name) end
 end
 
 function Adapter.lobbyMatches(lobby, selection, config)
@@ -351,10 +371,68 @@ function Adapter.createLobby(selection, config)
         config.Hardcore, config.Whitelist, false)
 end
 
+-- Lobby membership and global listings are the same evidence used by queue UI.
+function Adapter.lobbyMembers(lobby)
+    local members = {}
+    if not lobby then return members end
+    local encoded = lobby:GetAttribute("Roster")
+    if type(encoded) == "string" then
+        local ok, rows = pcall(game:GetService("HttpService").JSONDecode, game:GetService("HttpService"), encoded)
+        if ok and type(rows) == "table" then
+            for _, row in pairs(rows) do
+                if type(row.n) == "string" then members[row.n:lower()] = tonumber(row.l) or true end
+            end
+        end
+    end
+    for _, child in ipairs(lobby:GetChildren()) do
+        if child:IsA("StringValue") and child.Name ~= "mapName" then
+            local who = Players:FindFirstChild(child.Name)
+            members[child.Name:lower()] = who and Adapter.level(who) or members[child.Name:lower()] or true
+        end
+    end
+    return members
+end
+
+local lobbySearchIndex = {}
+function Adapter.joinLobby(hostName, dungeon, catalog)
+    local lobby = Adapter.findLobby(hostName)
+    if lobby then
+        if Adapter.lobbyMembers(lobby)[player.Name:lower()] then return true, "Joined Host lobby; waiting for departure" end
+        local map = lobby:FindFirstChild("mapName")
+        local required = Adapter.value(map, "minLevelReq")
+        if not required or not Adapter.level() or Adapter.level() < required then return false, "Host lobby level requirement unavailable or unmet" end
+        local private = map and map:FindFirstChild("private")
+        if private and private.Value and not private:FindFirstChild(player.Name) then return false, "Waiting for Host whitelist" end
+        Adapter.call("joinDungeon", hostName)
+        return true, "Joining Host lobby"
+    end
+    if dungeon and remotes:FindFirstChild("listGlobalParties") then
+        local maps = {}
+        for name in pairs(catalog or {}) do table.insert(maps, name) end
+        table.sort(maps)
+        local index = (lobbySearchIndex[hostName] or 0) % math.max(1, #maps) + 1
+        lobbySearchIndex[hostName] = index
+        local queries = { dungeon }
+        if maps[index] and maps[index] ~= dungeon then table.insert(queries, maps[index]) end
+        for _, mapName in ipairs(queries) do
+        local listings = Adapter.call("listGlobalParties", mapName)
+        for _, entry in ipairs(type(listings) == "table" and listings or {}) do
+            if entry.ownerName == hostName and tonumber(entry.minLevelReq)
+                and Adapter.level() and Adapter.level() >= tonumber(entry.minLevelReq) then
+                local ok = Adapter.call("joinGlobalParty", entry.jobId, entry.ownerName)
+                return ok ~= false, ok ~= false and "Joining Host global lobby" or "Host global lobby declined join; waiting"
+            end
+        end
+        end
+    end
+    return false, "Lobby reforming: waiting for a joinable Host lobby"
+end
+
 function Adapter.currentDungeon()
     local teleport = PM.GetPlaceTeleportData()
     local data = teleport and teleport.dungeonStats or {}
-    return { Dungeon = Adapter.value(workspace, "dungeonName", data.dungeonName), Difficulty = data.difficulty,
+    return { Dungeon = Adapter.value(workspace, "dungeonName", data.dungeonName),
+        Difficulty = Adapter.value(workspace, "difficulty", data.difficulty),
         levelReq = tonumber(data.levelReq) }
 end
 
@@ -393,22 +471,61 @@ function Adapter.failed()
 end
 
 function Adapter.finished()
+    if player.PlayerGui:FindFirstChild("completeGui") then return true end
     if Adapter.value(workspace, "dungeonProgress", "") == "bossKilled" then return true end
     local dungeon = workspace:FindFirstChild("dungeon")
     return Adapter.value(dungeon and dungeon:FindFirstChild("bossRoom"), "dungeonFinished", false) == true
 end
 
+-- PlaceManager has no IsDungeonOwner in the inspected client. The game's replay
+-- UI checks teleport.ownerId; prefer replicated active ownership when available.
+function Adapter.started()
+    if Adapter.value(workspace, "dungeonStarted", nil) == nil then return nil end
+    return PM.HasDungeonStarted()
+end
+
 function Adapter.replay()
-    assert(PM.IsDungeonOwner(player), "Only the host can replay")
+    local owner = Adapter.ownerId()
+    if owner and owner ~= player.UserId then return false, "Active dungeon owner is another account" end
+    if not Adapter.finished() then return false, "Dungeon completion has not replicated" end
     local teleport = PM.GetPlaceTeleportData()
     local data = table.clone(teleport and teleport.dungeonStats or {})
-    assert(type(data.dungeonName) == "string", "Run data unavailable")
     for _, name in ipairs({ "dungeonName", "dungeonProgress", "dungeonStarted", "hardcore" }) do
         local value = Adapter.value(workspace, name, nil)
         if value ~= nil then data[name] = value end
     end
+    data.isHardcore = data.hardcore
+    local dungeon = workspace:FindFirstChild("dungeon")
+    for _, container in pairs({ dungeon, dungeon and dungeon:FindFirstChild("bossRoom") }) do
+        for _, value in ipairs(container:GetChildren()) do
+            if value:IsA("ValueBase") then data[value.Name] = value.Value end
+        end
+    end
+    if type(data.dungeonName) ~= "string" then return false, "Run data unavailable" end
+    -- Same payload/remote as ReplayDungeonButton; server validates ownership.
     return Adapter.call("replayDungeon", data)
 end
+
+Adapter.PermanentBoosts = {
+    { name = "x2 Gold", key = "goldGamepass" },
+    { name = "+1 Drop", key = "extraItemGamepass" },
+    { name = "VIP", key = "vip" },
+}
+Adapter.XPBoosts = {
+    { name = "XP 1h", id = 1013086750 }, { name = "XP 2h", id = 1013086878 }, { name = "XP 4h", id = 1013087251 },
+}
+function Adapter.boostOffer(entry)
+    return Adapter.call(entry.key and "getGoldGamepassPrice" or "getGoldXPBoostPrice", entry.key or entry.id)
+end
+function Adapter.buyBoost(entry, offer)
+    if type(offer) ~= "table" or offer.ready == false then return false end
+    -- Inspected gamepass interface charges Gold. Unknown/premium responses fail closed.
+    if entry.key and offer.currency ~= nil and offer.currency ~= "gold" then return false end
+    if not entry.key and offer.currency ~= "gold" then return false end
+    if entry.key then return Adapter.call("requestGoldGamepassPurchase", entry.key) end
+    return Adapter.call("requestGoldXPBoostPurchase", entry.id, "gold")
+end
+function Adapter.gold() return tonumber(Adapter.value(player:FindFirstChild("leaderstats"), "Gold")) end
 
 return Adapter
 
@@ -687,9 +804,9 @@ end
 function PartySync.new(config, mode, isAlive)
     local Http = game:GetService("HttpService")
     local player = game:GetService("Players").LocalPlayer
-    local sync = { status = "Sync off" }
+    local sync = { status = "Sync disabled: using presence-only coordination" }
     local context, response, receivedAt, pending, acknowledged, lastAttempt = nil, nil, nil, nil, false, -math.huge
-    local generation = 0
+    local generation, relayBusy = 0, false
     local files = {
         available = type(writefile) == "function" and type(readfile) == "function"
             and type(isfile) == "function" and type(makefolder) == "function",
@@ -715,8 +832,8 @@ function PartySync.new(config, mode, isAlive)
         return pcall(makefolder, path)
     end
     local function readJSON(path)
-        if not files.available or not path or not isfile(path) then return nil end
-        local ok, value = pcall(function() return Http:JSONDecode(readfile(path)) end)
+        if not files.available or not path then return nil end
+        local ok, value = pcall(function() return isfile(path) and Http:JSONDecode(readfile(path)) or nil end)
         return ok and type(value) == "table" and value or nil
     end
     local function writeJSON(path, value)
@@ -745,7 +862,7 @@ function PartySync.new(config, mode, isAlive)
         writeJSON(heartbeatPath(player.UserId), {
             version = 1, userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
             enabled = config.Enabled, ready = config.Enabled and context.ready and now - context.at < 2,
-            healCount = context.healCount,
+            healCount = context.healCount, phase = context.phase, dungeon = context.dungeon,
             at = wallTime(),
         })
     end
@@ -784,40 +901,68 @@ function PartySync.new(config, mode, isAlive)
             and member.jobId == game.JobId and member.placeId == game.PlaceId
     end
 
-    function sync.Update(roster, host, carry, ready, healCount)
+    function sync.Update(roster, host, carry, ready, healCount, phase, dungeon)
         reset()
         local ids = {}
         for _, account in ipairs(roster) do table.insert(ids, account.id) end
         context = { roster = ids, hostId = host.id, carryId = carry.id, ready = ready,
-            healCount = tonumber(healCount), at = os.clock() }
+            healCount = tonumber(healCount), phase = phase, dungeon = dungeon, at = os.clock() }
         if not files.room then setupRoom(ids, host.id, carry.id) end
     end
     function sync.Pause()
         if context then context.ready = false end
         files.lastWrite = -math.huge
     end
-    function sync.Regroup(reason)
-        reset()
-        if not config.SyncEnabled or config.Role ~= "Host" then return true end
-        if files.shared and writeJSON(commandPath(), {
-            version = 1, jobId = game.JobId, reason = reason, at = wallTime(),
-        }) then return true end
-        if not pending then pending = reason; acknowledged = false; lastAttempt = -math.huge end
-        return acknowledged
+    function sync.SetPhase(phase, dungeon)
+        if context then
+            context.phase, context.dungeon = phase, dungeon or context.dungeon
+            files.lastWrite = -math.huge
+            if config.SyncEnabled then writeHeartbeat(os.clock()) end
+        end
     end
-    function sync.Command()
+    function sync.Member(id)
         reset()
         if not config.SyncEnabled then return nil end
-        local command = readJSON(commandPath())
-        if fresh(command, 30) and command.jobId == game.JobId and type(command.reason) == "string" then
-            return command.reason
-        end
-        local responseLimit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 3 or 20
-        if response and receivedAt and os.clock() - receivedAt <= responseLimit then
-            command = response.command
-            if type(command) == "table" and command.jobId == game.JobId and type(command.reason) == "string" then
-                return command.reason
+        local member = readJSON(heartbeatPath(id))
+        if fresh(member, 3) and member.userId == id then return member end
+        local now = os.clock()
+        local limit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 5 or 35
+        if response and receivedAt and now - receivedAt <= limit then
+            for _, entry in ipairs(response.members) do
+                if entry.userId == id and type(entry.age) == "number" and entry.age + now - receivedAt <= limit then
+                    return entry
+                end
             end
+        end
+    end
+    function sync.NewCommand(phase, reason)
+        local now = wallTime()
+        return { version = 2, id = Http:GenerateGUID(false), authorId = player.UserId,
+            jobId = game.JobId, placeId = game.PlaceId, dungeon = context and context.dungeon,
+            phase = phase, reason = reason, at = now, expiresAt = now + 90 }
+    end
+    function sync.Announce(command)
+        reset()
+        if not config.SyncEnabled then return true end
+        if not pending or pending.id ~= command.id then
+            pending, acknowledged, lastAttempt = command, false, -math.huge
+        end
+        -- Write before departure even if not every script has been observed yet.
+        if writeJSON(commandPath(), command) and files.shared then return true end
+        return acknowledged
+    end
+    function sync.Command(hostAbsent)
+        reset()
+        if not config.SyncEnabled or not context then return nil end
+        local function valid(command)
+            return Logic.validCommand(command, context.hostId, context.carryId,
+                game.JobId, game.PlaceId, wallTime(), hostAbsent)
+        end
+        local command = readJSON(commandPath())
+        if valid(command) then return command end
+        local responseLimit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 3 or 20
+        if response and receivedAt and os.clock() - receivedAt <= responseLimit and valid(response.command) then
+            return response.command
         end
     end
     function sync.HealCounts(roster)
@@ -843,22 +988,26 @@ function PartySync.new(config, mode, isAlive)
     end
     function sync.Ready(roster)
         reset()
-        if not config.SyncEnabled then sync.status = "Sync off"; return true end
-        local ready, missing = fileReadiness(roster)
-        if ready then sync.status = "File sync: all scripts ready"; return true end
-        if files.shared then
-            sync.status = "File sync waiting: " .. table.concat(missing, ", ")
-            return false
+        if not config.SyncEnabled then
+            sync.status = config.RequireScriptsReady and "Sync disabled: enable sync to require selected scripts" or "Sync disabled: using presence-only coordination"
+            return not config.RequireScriptsReady
         end
+        local ready, missing = fileReadiness(roster)
+        if ready then sync.status = "Sync healthy: file transport"; return true end
         local relayReady, relayMissing = relayReadiness(roster)
-        if relayReady then sync.status = "Relay sync: all scripts ready"; return true end
-        local waiting = missing or relayMissing
-        if files.available then
-            sync.status = waiting and ("Looking for shared files: " .. table.concat(waiting, ", ")) or "Looking for shared executor workspace"
+        if relayReady then sync.status = "Sync healthy: relay fallback"; return true end
+        local waiting = table.concat(relayMissing or missing or {}, ", ")
+        if files.shared then
+            sync.status = "Sync: heartbeat stale/not ready: " .. waiting
         elseif relayMissing then
-            sync.status = "Relay waiting: " .. table.concat(relayMissing, ", ")
+            sync.status = "Sync: waiting for " .. waiting .. " heartbeat (relay)"
         else
-            sync.status = "Sync unavailable: executor files are isolated and relay is offline"
+            sync.status = "Sync unavailable: shared files unconfirmed (possibly isolated); relay unavailable"
+                .. (waiting ~= "" and ("; waiting for " .. waiting .. " heartbeat") or "")
+        end
+        if not config.RequireScriptsReady then
+            sync.status = sync.status .. "; presence-only fallback active"
+            return true
         end
         return false
     end
@@ -867,13 +1016,14 @@ function PartySync.new(config, mode, isAlive)
         while isAlive() do
             reset()
             local now = os.clock()
-            if not config.SyncEnabled then sync.status = "Sync off"
+            if not config.SyncEnabled then
+                sync.status = config.RequireScriptsReady and "Sync disabled: selected scripts required" or "Sync disabled: using presence-only coordination"
             elseif context then
                 writeHeartbeat(now)
                 local url = config.SyncURL:gsub("/+$", "")
                 local kind = relayKind(url)
                 local interval = kind == "local" and 0.5 or 10
-                if kind and #config.SyncKey >= 32 and now - lastAttempt >= interval then
+                if not relayBusy and kind and #config.SyncKey >= 32 and now - lastAttempt >= interval then
                     lastAttempt = now
                     local request = request or http_request or (syn and syn.request)
                     if type(request) == "function" then
@@ -884,27 +1034,31 @@ function PartySync.new(config, mode, isAlive)
                             roster = context.roster, hostId = context.hostId, carryId = context.carryId,
                             userId = player.UserId, jobId = game.JobId, placeId = game.PlaceId, mode = mode,
                             enabled = config.Enabled, ready = config.Enabled and context.ready and not pending and now - context.at < 5,
-                            healCount = context.healCount,
-                            regroup = pending,
+                            healCount = context.healCount, phase = context.phase, dungeon = context.dungeon,
+                            transition = pending,
                         }
-                        local ok, result = pcall(function()
-                            local timeout = kind == "local" and 2 or 8
-                            local reply = request({ Url = url .. "/sync", Method = "POST", Timeout = timeout,
-                                Headers = { ["Content-Type"] = "application/json", Authorization = "Bearer " .. config.SyncKey },
-                                Body = Http:JSONEncode(payload) })
-                            assert(reply and reply.StatusCode == 200, "Relay HTTP " .. tostring(reply and reply.StatusCode))
-                            local decoded = Http:JSONDecode(reply.Body)
-                            assert(decoded.protocol == 1 and type(decoded.members) == "table", "Invalid relay response")
-                            return decoded
+                        relayBusy = true
+                        task.spawn(function()
+                            local ok, result = pcall(function()
+                                local timeout = kind == "local" and 2 or 8
+                                local reply = request({ Url = url .. "/sync", Method = "POST", Timeout = timeout,
+                                    Headers = { ["Content-Type"] = "application/json", Authorization = "Bearer " .. config.SyncKey },
+                                    Body = Http:JSONEncode(payload) })
+                                assert(reply and reply.StatusCode == 200, "Relay HTTP " .. tostring(reply and reply.StatusCode))
+                                local decoded = Http:JSONDecode(reply.Body)
+                                assert(decoded.protocol == 1 and type(decoded.members) == "table", "Invalid relay response")
+                                return decoded
+                            end)
+                            relayBusy = false
+                            if not isAlive() then return end
+                            reset()
+                            if generation == sentGeneration and signature() == sentSignature then
+                                if ok and os.clock() - sentAt <= (kind == "local" and 2 or 8) then
+                                    response, receivedAt = result, sentAt
+                                    if pending and type(result.command) == "table" and pending.id == result.command.id then acknowledged = true end
+                                else response, receivedAt = nil, nil end
+                            end
                         end)
-                        if not isAlive() then return end
-                        reset()
-                        if generation == sentGeneration and signature() == sentSignature then
-                            if ok and os.clock() - sentAt <= (kind == "local" and 2 or 8) then
-                                response, receivedAt = result, sentAt
-                                if pending and type(result.command) == "table" and result.command.jobId == game.JobId then acknowledged = true end
-                            else response, receivedAt = nil, nil end
-                        end
                     end
                 end
             else sync.status = "Sync: waiting for valid party setup" end
@@ -922,7 +1076,7 @@ local Roles = {}
 function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local player = game:GetService("Players").LocalPlayer
     local Players = game:GetService("Players")
-    local state = { sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
+    local state = { phase = mode == "Lobby" and "LOBBY_REFORMING" or "ASSEMBLING", phaseAt = os.clock(), sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
         finished = false, finishedAt = nil, missingAt = nil, readyAt = nil, returning = false, requests = {}, responded = {} }
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
     local rosterKey, catalogReady = nil, false
@@ -936,6 +1090,9 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     end
     runtime.Levels = runtime.Levels or {}
     local revision, tickRevision = 0, 0
+    local function wallTime()
+        return DateTime and DateTime.now().UnixTimestampMillis / 1000 or os.time()
+    end
     local function current() return isAlive() and revision == tickRevision end
     local function active() return current() and config.Enabled end
     local function healerRole() return config.Role == "Host" or config.Role == "Alt" end
@@ -948,22 +1105,64 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         state.farming = false
         controller.SetRunning(false)
     end
-    local function returnLobby(reason, now)
-        stop()
-        state.returning, state.status = true, reason
-        if sync and not sync.Regroup(reason) then
-            state.status = "Waiting for relay to announce regroup"
-            return
+    local function phase(value, now)
+        if state.phase ~= value then
+            state.phase, state.phaseAt = value, now
+            state.missingAt, state.readyAt, state.stableAt, state.partySeen = nil, nil, nil, false
         end
-        if due("return", 15, now) and active() then save(); Adapter.call("teleToLobby") end
+        if sync then sync.SetPhase(value, Adapter.currentDungeon()) end
+    end
+    local function beginTransition(value, reason, now, command)
+        stop()
+        phase(value, now)
+        state.status, state.transitionAt = reason, now
+        local authority = config.Role == "Host" or config.Role == "Carry" and host
+            and not Players:GetPlayerByUserId(host.id) and value == "RECOVERING"
+        state.transition = command or (authority and sync and sync.NewCommand(value, reason))
+        state.transitionLocal = command == nil and authority
+        state.returning = value ~= "REPLAYING"
+        state.returnReason = reason
+        if state.transition then
+            runtime.Transition = state.transition
+            runtime.ConsumedTransition = state.transition.id
+        end
+    end
+    local function announced(now)
+        if not state.transitionLocal or not sync or not state.transition then return true end
+        if sync.Announce(state.transition) then return true end
+        -- A dead transport must not strand a completed host. Followers can use
+        -- the host's departure as presence-only evidence after this bounded window.
+        local wait = config.SyncURL ~= "" and 10 or 1
+        return now - state.transitionAt >= wait
+    end
+    local function returnLobby(reason, now, value, command)
+        if not state.returning then beginTransition(value or "RECOVERING", reason, now, command) end
+        stop()
+        state.status = state.returnReason
+        if not announced(now) then state.status = "Announcing party return"; return end
+        local attempts = state.returnAttempts or 0
+        local interval = math.min(30, 3 * 2 ^ math.min(attempts, 4))
+        if due("return", interval, now) and active() then
+            state.returnAttempts = attempts + 1
+            runtime.PendingAction = { jobId = game.JobId, phase = state.phase, attempts = state.returnAttempts, at = wallTime() }
+            save()
+            local ok, result = pcall(Adapter.call, "teleToLobby")
+            state.status = ok and result ~= false and "Return requested; waiting for teleport"
+                or ("Return failed; retrying in " .. interval .. "s")
+        end
     end
     local function configure()
         local key = table.concat({ config.Role, config.Host, config.Carry, config.Alts }, "|")
         if key ~= rosterKey then
             local newRoster, newHost, newCarry = Adapter.roster(config)
             if not active() then return false end
+            if rosterKey then
+                state.transition, state.transitionAt, state.returnAttempts, state.replayAttempts = nil, nil, nil, nil
+                table.clear(times)
+            end
             roster, host, carry, rosterKey = newRoster, newHost, newCarry, key
             state.missingAt, state.readyAt, state.returning, state.partySeen = nil, nil, false, false
+            state.stableAt = nil
             healCache = {}
             state.party = "Host: " .. host.name .. " | Carry: " .. carry.name .. " | " .. (#roster - 2) .. " selected alts"
         end
@@ -1112,9 +1311,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
         end
     end
+    local function joinable()
+        local owner = Adapter.ownerId()
+        return mode == "Dungeon" and state.phase == "PRE_START" and not state.finished
+            and not state.returning and not state.runStarted and not state.teleportAt and Adapter.started() == false
+            and not Adapter.finished() and not Adapter.failed() and (not owner or owner == player.UserId)
+    end
     local function processRequests(now)
-        if config.Role ~= "Host" or not config.AutoAccept or Adapter.PlaceManager.HasDungeonStarted() then return end
-        -- Recover prompts whose showJoinRequest event fired before this script loaded.
+        if config.Role ~= "Host" then return end
         if due("requestScan", 1, now) then
             for _, pending in ipairs(Adapter.pendingRequests()) do
                 if not state.requests[pending.id] and now - (state.responded[pending.id] or -math.huge) >= 5 then
@@ -1123,16 +1327,17 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
         end
         for id, request in pairs(state.requests) do
-            if now - request.at > 45 or request.prompt and not request.prompt.Parent then state.requests[id] = nil
-            elseif config.Role == "Host" and config.AutoAccept and not Adapter.PlaceManager.HasDungeonStarted() then
+            if request.prompt and not request.prompt.Parent then state.requests[id] = nil
+            elseif now - (state.responded[id] or -math.huge) >= 5 then
                 local allowed = false
-                for _, account in ipairs(roster) do
-                    if request.name:lower() == account.name:lower() and account.id ~= host.id then allowed = true; break end
+                if config.AutoAccept and joinable() and now - request.at <= 45 then
+                    for _, account in ipairs(roster) do
+                        if request.name:lower() == account.name:lower() and account.id ~= host.id then allowed = true; break end
+                    end
                 end
                 if active() then
-                    Adapter.call("respondJoinRequest", id, allowed)
-                    state.responded[id] = now
-                    state.requests[id] = nil
+                    state.responded[id], state.requests[id] = now, nil
+                    Adapter.call("respondJoinRequest", id, allowed and joinable())
                 end
             end
         end
@@ -1147,16 +1352,31 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     function state.Finish(failed)
         state.failed = state.failed or failed == true
         state.finished, state.finishedAt = true, state.finishedAt or os.clock()
+        if not state.transition then phase("REWARDS_SETTLING", state.finishedAt) end
         stop()
     end
+    function state.TeleportStarted()
+        state.teleportAt = os.clock()
+        stop()
+        if sync then sync.Pause() end
+    end
     function state.TeleportFailed()
-        state.status = "Teleport failed; retrying"
-        times["return"], times["queue"], times["replay"] = nil, nil, nil
+        state.teleportAt = nil
+        state.status = "Teleport failed; bounded retry pending"
+        -- Retain attempt timestamps: failure callbacks must not bypass rate limits.
     end
     function state.Stop() revision = revision + 1; stop(); if sync then sync.Pause() end end
     function state.Tick(now)
         tickRevision = revision
         if not isAlive() then return end
+        if state.teleportAt then
+            stop()
+            if now - state.teleportAt < 30 then state.status = "Party teleport in progress"; return end
+            state.teleportAt = nil
+        end
+        if mode == "Dungeon" then
+            if Adapter.failed() then state.Finish(true) elseif Adapter.finished() then state.Finish() end
+        end
         if not Adapter.level() then
             stop(); state.status = "Waiting for player data"
             state.sellStatus = config.AutoSell and "Auto sell: waiting for player data" or "Auto sell: off"
@@ -1170,7 +1390,24 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         state.status = "Checking party setup"
         if not configure() then return end
-        if sync then sync.Update(roster, host, carry, true, runtime.Heals[tostring(player.UserId)]) end
+        if not state.restored then
+            state.restored = true
+            local saved = runtime.Transition
+            if mode == "Dungeon" and Logic.validCommand(saved, host.id, carry.id, game.JobId, game.PlaceId,
+                wallTime(), not Players:GetPlayerByUserId(host.id)) then
+                beginTransition(saved.phase, saved.reason, now, saved)
+                state.transitionLocal = saved.authorId == player.UserId
+                state.transitionAt = now - math.max(0, wallTime() - saved.at)
+                local action = runtime.PendingAction
+                if type(action) == "table" and action.jobId == game.JobId and action.phase == saved.phase
+                    and type(action.at) == "number" and type(action.attempts) == "number" then
+                    local key = saved.phase == "REPLAYING" and "replay" or "return"
+                    times[key] = now - math.max(0, wallTime() - action.at)
+                    if key == "replay" then state.replayAttempts = action.attempts else state.returnAttempts = action.attempts end
+                end
+            end
+        end
+        if sync then sync.Update(roster, host, carry, true, runtime.Heals[tostring(player.UserId)], state.phase, Adapter.currentDungeon()) end
         if mode == "Lobby" and not catalogReady then
             state.status = "Loading dungeon requirements"
             local catalog = Adapter.catalog()
@@ -1184,123 +1421,229 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             local stat = ({ Stamina = "stamina", ["Spell Power"] = "spellPower", ["Physical Power"] = "physicalPower" })[config.UpgradeStat]
             if points > 0 and stat then Adapter.call("spendSkillPoint", stat, points) end
         end
+        if mode == "Dungeon" then runtime.LastDungeonJob = game.JobId end
         local members = Adapter.members(roster)
         for _, member in ipairs(members) do
             if member.level then runtime.Levels[tostring(member.id)] = member.level end
         end
+        local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
+        local hostPresent = Players:GetPlayerByUserId(host.id) ~= nil
+        local hostState = sync and sync.Member(host.id)
+        local scriptsReady = not sync or sync.Ready(roster)
+        state.party = ready and (equal and "Party present; levels match" or "Party present; progression uses lowest Host/Alt level")
+            or ("Waiting: " .. table.concat(missing, ", "))
         if mode == "Lobby" then
             stop()
+            phase("LOBBY_REFORMING", now)
+            runtime.Transition = nil
             if config.Role ~= "Host" then
-                state.status = config.AutoJoin and ("Requesting " .. host.name) or "Auto join disabled"
-                if config.AutoJoin and due("join", config.JoinInterval, now) and active() then
-                    local ok, reason = Adapter.call("sendJoinRequest", host.name)
-                    if ok == false then state.status = "Join request: " .. tostring(reason or "host not ready") end
+                if not config.AutoJoin then state.status = "Auto join disabled"; return end
+                -- Positive Host PRE_START presence permits requests to the dungeon.
+                -- A completed/returning Host heartbeat explicitly forbids them.
+                local hostJoinable = hostState and hostState.enabled and hostState.ready
+                    and hostState.mode == "Dungeon" and hostState.phase == "PRE_START"
+                    and hostState.jobId ~= runtime.LastDungeonJob
+                state.status = hostJoinable and ("Requesting " .. host.name) or "Lobby reforming: waiting for Host"
+                if due("join", config.JoinInterval, now) and active() then
+                    if hostJoinable then
+                        local ok, reason = Adapter.call("sendJoinRequest", host.name, false)
+                        if ok == false then state.status = "Join request: " .. tostring(reason or "Host not ready") end
+                    elseif not hostState or hostState.mode == "Lobby" and hostState.phase == "LOBBY_REFORMING" then
+                        -- Without transport, assemble in an actual lobby queue and
+                        -- depart together. Never probe a completed dungeon with requests.
+                        local choice = selection(partyLevel(members) or Adapter.level())
+                        local dungeon = hostState and hostState.dungeon and hostState.dungeon.Dungeon
+                            or choice and choice.Dungeon
+                        local _, reason = Adapter.joinLobby(host.name, dungeon, runtime.Catalog)
+                        state.status = reason
+                    else state.status = "Waiting: Host phase " .. tostring(hostState.phase) end
                 end
                 return
             end
             if not config.AutoBest then state.status = "Auto best dungeon disabled"; return end
-            -- Recovery may have left an alt behind. Use its last observed level as an eligibility ceiling.
+            local lobby = Adapter.findLobby()
+            local queued = Adapter.lobbyMembers(lobby)
+            for _, member in ipairs(roster) do
+                local level = queued[member.name:lower()]
+                if type(level) == "number" then runtime.Levels[tostring(member.id)] = level end
+            end
             local level = partyLevel(members) or Adapter.level()
             local chosen = assert(selection(level), "No eligible dungeon; refresh the lobby catalog")
+            if sync then sync.SetPhase("LOBBY_REFORMING", chosen) end
             state.status = "Host: " .. chosen.Dungeon .. " / " .. chosen.Difficulty
             if due("queue", 5, now) and active() then
-                local lobby = Adapter.findLobby()
                 if lobby then
                     if not Adapter.lobbyMatches(lobby, chosen, config) then
-                        Adapter.call("leaveGame")
-                        state.status = "Recreating lobby with selected options"
-                        return
+                        Adapter.call("leaveGame"); state.status = "Recreating lobby with selected options"; return
                     end
                     if config.Whitelist then
                         for _, account in ipairs(roster) do if account.id ~= host.id then Adapter.call("addPlayerToWhitelist", account.name) end end
                     end
-                    if active() then
-                        state.status = "Entering " .. chosen.Dungeon .. " / " .. chosen.Difficulty
-                        assert(Adapter.call("startDungeon") ~= false, "Server declined dungeon entry; retrying")
+                    -- Presence-only fallback has no remote phase evidence: gather
+                    -- everyone in the queue before entering the dungeon.
+                    local queuedMissing = {}
+                    for _, account in ipairs(roster) do
+                        if not queued[account.name:lower()] then table.insert(queuedMissing, account.name) end
                     end
+                    if #queuedMissing > 0 then
+                        state.status = "Lobby reforming: waiting for " .. table.concat(queuedMissing, ", "); return
+                    end
+                    save(); Adapter.call("startDungeon")
+                    state.status = "Entering " .. chosen.Dungeon .. " / " .. chosen.Difficulty
                 else
-                    state.status = "Creating " .. chosen.Dungeon .. " / " .. chosen.Difficulty
-                    assert(Adapter.createLobby(chosen, config), "Server declined dungeon creation; check your level and lobby state")
-                    state.status = "Lobby created; entering shortly"
+                    assert(Adapter.createLobby(chosen, config), "Server declined dungeon creation")
+                    state.status = "Lobby created; gathering selected accounts"
                 end
             end
             return
         end
-        -- Owner metadata is not reliable on first entry or after ownership transfers.
-        -- Role selection controls requests; the server validates owner-only actions.
-        if sync and config.Role ~= "Host" then
-            local regroup = sync.Command()
-            if regroup then returnLobby("Host regroup: " .. regroup, now); return end
+        local command = sync and sync.Command(not hostPresent)
+        if command and command.id ~= runtime.ConsumedTransition
+            and (not state.transition or command.at >= state.transition.at) then
+            runtime.ConsumedTransition = command.id
+            if command.phase == "REPLAYING" then
+                beginTransition("REPLAYING", "Host replay requested; waiting for teleport", now, command)
+            else
+                returnLobby(command.reason, now, command.phase, command); return
+            end
         end
-        processRequests(now)
-        if not active() then return end
-        local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
-        state.party = ready and (equal and "Party present; host and alts at the same level" or "Party present; waiting for levels to match")
-            or ("Missing: " .. table.concat(missing, ", "))
-        if ready then state.partySeen = true; state.missingAt = nil
-        else state.missingAt = state.missingAt or now end
-        local scriptsReady = not sync or sync.Ready(roster)
-        local canRun = ready and scriptsReady
-        if canRun then state.readyAt = state.readyAt or now else state.readyAt = nil end
-        if state.returning then returnLobby(state.status, now); return end
-        local started = Adapter.PlaceManager.HasDungeonStarted()
-        -- Initial assembly has no timeout. Recover only a party that was assembled
-        -- or a run already in progress, so slow joins do not eject the host.
-        if config.OCD and (state.partySeen or started) and not ready and now - state.missingAt >= config.RecoveryGrace then
-            returnLobby("OCD recovery: regrouping in lobby", now); return
-        end
-        if Adapter.failed() then state.Finish(true)
-        elseif Adapter.finished() then state.Finish() end
-        if state.finishedAt and now - state.finishedAt >= 5 and not state.rewardsRefreshed then
-            healCache = {}; times.inventory = nil; state.rewardsRefreshed = true
-            -- Give every client time to inspect its newly awarded inventory and
-            -- publish the count before the host chooses replay versus progression.
-            if config.ProvisionHeals then state.healsSettlingUntil = now + 2 end
-        end
-        local allHealed, healMissing = false, {}
-        if config.ProvisionHeals then allHealed, healMissing = checkHeals(members, now) end
-        if config.ProvisionHeals then
-            state.party = state.party .. (allHealed and " | Universal Heals ready"
-                or " | Heals missing: " .. table.concat(healMissing, ", "))
-        end
-        if not active() then return end
-        -- Choose for the lowest host/alt level so unequal XP never strands a lower
-        -- account in an old dungeon or sends it somewhere it cannot enter.
-        local eligibleLevel = partyLevel(members)
-        local chosen = eligibleLevel and selection(eligibleLevel, config.ProvisionHeals and allHealed or nil)
-        local current = Adapter.currentDungeon()
-        local switchEnabled = config.Role == "Host" and config.AutoBest
-            or config.Role ~= "Host" and config.AutoSwitch and not config.SyncEnabled
-        local switch = switchEnabled and ready and chosen and not Logic.sameDungeon(chosen, current)
+        if state.returning then processRequests(now); returnLobby(state.returnReason, now); return end
         if state.finished then
             stop()
-            if state.failed then state.status = "Run failed; waiting for the game to return to lobby"; return end
-            -- Let replicated levels and newly awarded drops settle before replay/progression.
-            if now - state.finishedAt < 5 then state.status = "Waiting for rewards"; return end
-            if state.healsSettlingUntil and now < state.healsSettlingUntil then
-                state.status = "Syncing Universal Heal rewards"; return
+            if not state.transition then phase("REWARDS_SETTLING", now) end
+            processRequests(now)
+            if now - state.finishedAt < 5 then state.status = "Rewards settling"; return end
+            if not state.rewardsRefreshed then
+                healCache = {}; times.inventory = nil; state.rewardsRefreshed = true
+                if config.ProvisionHeals then state.healsSettlingUntil = now + 2 end
             end
-            if switch then returnLobby("Progression: " .. chosen.Dungeon .. " / " .. chosen.Difficulty, now); return end
-            state.status = ready and "Run ended; replaying current dungeon" or "Run ended; waiting for party"
-            if config.Role == "Host" and canRun and due("replay", 15, now) and active() then Adapter.replay() end
+            if config.Role ~= "Host" then
+                state.status = state.phase == "REPLAYING" and "Replay requested; waiting for teleport" or "Rewards settled; waiting for Host decision"
+                -- Host departure is the fallback authority signal. A replay command
+                -- suspends this fallback while the game's party teleport completes.
+                if not hostPresent and not state.transition then
+                    state.hostLeftAt = state.hostLeftAt or now
+                    -- Without an explicit decision, departure may be replay.
+                    -- Allow the same bounded grace as an in-flight teleport.
+                    state.status = "Host departed; waiting for party teleport"
+                    local confirmedReturn = hostState and hostState.mode == "Lobby" and hostState.phase == "LOBBY_REFORMING"
+                    if confirmedReturn or now - state.hostLeftAt >= 30 then
+                        returnLobby("Following Host return", now, "PROGRESSION_RETURN")
+                    end
+                elseif state.transition and now - state.transitionAt > 90 then
+                    returnLobby("Replay teleport timed out; regrouping", now)
+                else state.hostLeftAt = nil end
+                return
+            end
+            if state.failed then returnLobby("Run failed: regrouping in lobby", now); return end
+            local allHealed = false
+            if config.ProvisionHeals then allHealed = checkHeals(members, now) end
+            if state.healsSettlingUntil and now < state.healsSettlingUntil then state.status = "Rewards settling: Universal Heals"; return end
+            local eligibleLevel = partyLevel(members)
+            local chosen = eligibleLevel and selection(eligibleLevel, config.ProvisionHeals and allHealed or nil)
+            local dungeon = Adapter.currentDungeon()
+            if not state.transition and config.AutoBest and ready
+                and Logic.shouldProgress(chosen, dungeon, config.ProvisionHeals and allHealed and dungeon.Dungeon == "Pirate Island") then
+                returnLobby("Progression unlocked: returning for " .. chosen.Dungeon .. " / " .. chosen.Difficulty, now, "PROGRESSION_RETURN"); return
+            end
+            if not ready then
+                state.status = "Run complete: " .. state.party
+                if now - state.finishedAt >= config.RecoveryGrace then returnLobby("Replay party incomplete; regrouping", now) end
+                return
+            end
+            if not state.transition then beginTransition("REPLAYING", "Replaying current dungeon", now) end
+            if not announced(now) then state.status = "Announcing current dungeon replay"; return end
+            local attempts = state.replayAttempts or 0
+            if attempts >= 3 and now - (times.replay or now) >= 12 then
+                state.transitionAt = nil
+                returnLobby("Replay failed after 3 attempts; regrouping", now); return
+            end
+            local interval = math.min(12, 4 * 2 ^ math.max(0, attempts - 1))
+            state.status = attempts == 0 and "Replaying current dungeon" or ("Replay requested; waiting for teleport (retry in "
+                .. math.max(0, math.ceil(interval - (now - (times.replay or now)))) .. "s)")
+            if state.replayError then
+                state.status = "Replay failed; retrying in " .. math.max(0, math.ceil(interval - (now - (times.replay or now)))) .. "s: " .. state.replayError
+            end
+            if attempts < 3 and due("replay", interval, now) and active() then
+                state.replayAttempts = attempts + 1
+                runtime.PendingAction = { jobId = game.JobId, phase = "REPLAYING", attempts = state.replayAttempts, at = wallTime() }
+                save()
+                local ok, result, reason = pcall(Adapter.replay)
+                state.replayError = not (ok and result ~= false) and tostring(reason or result) or nil
+                state.status = state.replayError and ("Replay failed; retrying in " .. interval .. "s: " .. state.replayError)
+                    or "Replay requested; waiting for teleport"
+            end
+            return
+        end
+        if state.transition then
+            stop(); processRequests(now)
+            state.status = "Host replay pending; waiting for completion/teleport"
+            if now - state.transitionAt > 90 then returnLobby("Replay timed out; regrouping", now) end
+            return
+        end
+        local started = Adapter.started()
+        if started == nil then phase("ASSEMBLING", now); stop(); state.status = "Waiting for dungeon state replication"; return end
+        if started then state.runStarted = true; state.endingAt = nil
+        elseif state.runStarted then
+            phase("REWARDS_SETTLING", now); stop(); processRequests(now)
+            state.endingAt = state.endingAt or now
+            state.status = "Rewards settling: waiting for completion replication"
+            if config.Role == "Host" and now - state.endingAt >= 30 then
+                returnLobby("Completion state unavailable; regrouping", now)
+            end
+            return
+        end
+        phase(started and "RUNNING" or "PRE_START", now)
+        processRequests(now)
+        local transition = hostState and hostState.jobId == game.JobId and
+            (hostState.phase == "REPLAYING" or hostState.phase == "PROGRESSION_RETURN" or hostState.phase == "RECOVERING")
+        if transition then
+            stop(); state.missingAt, state.partySeen = nil, false
+            state.status = "Waiting for Host transition: " .. hostState.phase; return
+        end
+        -- Only a fully replicated party observed in THIS stable phase arms OCD.
+        local loaded = ready
+        for _, member in ipairs(members) do if not member.level then loaded = false end end
+        if loaded then
+            state.stableAt = state.stableAt or now
+            if now - state.stableAt >= config.StartDelay then state.partySeen = true end
+            state.missingAt = nil
+        elseif not ready and state.partySeen then state.missingAt = state.missingAt or now
+        else state.missingAt = nil; state.stableAt = nil end
+        if not ready then
+            stop()
+            state.readyAt = nil
+            state.status = state.party
+            if config.OCD and state.missingAt then
+                local elapsed = now - state.missingAt
+                state.status = "OCD grace: " .. table.concat(missing, ", ") .. " missing " .. math.floor(elapsed) .. " / " .. config.RecoveryGrace .. "s"
+                if elapsed >= config.RecoveryGrace then
+                    -- Host is the authority; Carry takes over only when Host is lost.
+                    if config.Role == "Host" or not hostPresent and config.Role == "Carry" then
+                        returnLobby("OCD recovery: " .. table.concat(missing, ", "), now)
+                    elseif not hostPresent and not Players:GetPlayerByUserId(carry.id) then
+                        returnLobby("Following party recovery", now)
+                    end
+                end
+            end
             return
         end
         if not started then
             stop()
-            if switch and current.Dungeon == "Pirate Island" and allHealed then
-                returnLobby("Universal Heal ready; selecting best dungeon", now); return
-            end
-            state.status = canRun and "Party ready; waiting to start" or ready and "Waiting for selected scripts through relay" or "Waiting for selected accounts"
-            -- Carry owns Level Kaitun policy; the host mirrors its readiness gate for owner-only servers.
-            if canRun and now - state.readyAt >= config.StartDelay and config.LevelKaitun
-                and (config.Role == "Carry" or config.Role == "Host") and due("start", 5, now) and active() then
-                Adapter.call("changeStartValue")
+            if config.RequireScriptsReady and not scriptsReady then state.readyAt = nil; state.status = sync and sync.status or "Sync transport unavailable"; return end
+            state.readyAt = state.readyAt or now
+            state.status = "Party ready; start delay " .. string.format("%.1f / %.1f", now - state.readyAt, config.StartDelay)
+            if config.Role == "Host" and config.LevelKaitun and now - state.readyAt >= config.StartDelay
+                and due("start", 5, now) and active() then
+                state.status = "Starting dungeon"; Adapter.call("changeStartValue")
             end
             return
         end
+        -- Heartbeat readiness gates START only, never local movement during a run.
+        local canRun = ready
         state.farming = config.Role == "Carry" and config.LevelKaitun and canRun
         controller.SetRunning(state.farming)
-        state.status = state.farming and "Carry: pathfinding farm" or healerRole() and config.AutoHealer and (config.Role .. ": Universal Heal") or "Waiting for carry"
+        state.status = state.farming and "Carry farm active" or healerRole() and config.AutoHealer and (config.Role .. ": Universal Heal") or "Waiting for carry"
         if healerRole() and config.AutoHealer and healer and canRun then
             -- The slot scheduler alternates Q/E and still respects each tool cooldown.
             -- Stagger heals even when both slots are ready after joining or idling.
@@ -1318,6 +1661,66 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     return state
 end
 return Roles
+
+end)()
+local BoostManager = (function()
+-- Purchases use the inspected gold shop only; no MarketplaceService prompt path.
+local BoostManager = {}
+function BoostManager.new(config, runtime, isAlive)
+    runtime.Boosts = runtime.Boosts or {}
+    local state = { status = "Boosts: auto buy off", nextCheck = 0 }
+    function state.Tick(now)
+        if not config.AutoBuyBoosts then state.status = "Boosts: auto buy off"; return end
+        if now < state.nextCheck then return end
+        state.nextCheck = now + 15
+        local statuses = {}
+        local function inspect(entry)
+            local offer = Adapter.boostOffer(entry)
+            if type(offer) ~= "table" or offer.ready == false then
+                table.insert(statuses, entry.name .. ": waiting for shop data"); return "wait"
+            end
+            -- Saved observations are diagnostic only. Re-query server on every execute.
+            runtime.Boosts[entry.key or tostring(entry.id)] = offer
+            if entry.key and (offer.owned == true or Adapter.value(game:GetService("Players").LocalPlayer, entry.key, false)) then
+                table.insert(statuses, entry.name .. ": owned"); return "done"
+            end
+            if not entry.key and (tonumber(offer.remaining) == 0 or (tonumber(offer.nextAvailableIn) or 0) > 0) then
+                table.insert(statuses, entry.name .. ": unavailable this cycle"); return "done"
+            end
+            if not entry.key and offer.valid ~= true then
+                table.insert(statuses, entry.name .. ": offer unavailable"); return "wait"
+            end
+            local currency = offer.currency or (entry.key and "gold")
+            if currency ~= "gold" then
+                table.insert(statuses, entry.name .. ": " .. tostring(currency or "unknown currency") .. "; use game shop manually")
+                return entry.key and "manual" or "wait"
+            end
+            local cost, gold = tonumber(offer.cost), Adapter.gold()
+            if not cost or cost < 0 or not gold then
+                table.insert(statuses, entry.name .. ": waiting for price/balance"); return "wait"
+            end
+            if gold < cost then
+                table.insert(statuses, entry.name .. ": waiting for " .. string.format("%.0f", cost) .. " gold"); return "wait"
+            end
+            if not isAlive() or not config.AutoBuyBoosts then return "wait" end
+            Adapter.buyBoost(entry, offer)
+            table.insert(statuses, entry.name .. ": purchase requested; verifying server state")
+            return "requested"
+        end
+        local ok, reason = pcall(function()
+            for _, entry in ipairs(Adapter.PermanentBoosts) do
+                local result = inspect(entry)
+                if result ~= "done" and result ~= "manual" then return end
+            end
+            for _, entry in ipairs(Adapter.XPBoosts) do
+                if inspect(entry) ~= "done" then return end
+            end
+        end)
+        state.status = ok and table.concat(statuses, " | ") or ("Boosts: shop unavailable; retrying in 15s (" .. tostring(reason) .. ")")
+    end
+    return state
+end
+return BoostManager
 
 end)()
 local MODE = "Lobby"
@@ -1338,11 +1741,11 @@ env.DQRewriteResume = nil
 if env.DungeonQuestObsidian then env.DungeonQuestObsidian.Unload() end
 local configPath = "DungeonQuestRewrite-" .. player.UserId .. ".json"
 local C = {
-    Enabled = false, Role = "Carry", Host = "", Carry = "", Alts = "",
+    Enabled = false, AutoStartRole = false, AutoBuyBoosts = false, Role = "Carry", Host = "", Carry = "", Alts = "",
     AutoJoin = true, AutoAccept = true, Hardcore = false, Whitelist = true,
     LevelKaitun = true, AutoBest = true, AutoSwitch = true, ProvisionHeals = true,
     AutoHealer = false, AutoSell = false, KeepItems = "", KeepLegendary = true, AutoSkillPoints = false, UpgradeStat = "Stamina",
-    SyncEnabled = false, SyncURL = "", SyncKey = "",
+    SyncEnabled = false, RequireScriptsReady = false, SyncURL = "", SyncKey = "",
     OCD = false, RecoveryGrace = 45, JoinInterval = 10, StartDelay = 3,
     HideUI = false, CPUSaver = false, Waypoints = false,
     Distance = 20, SpellRange = 26, AutoDodge = true, AdaptiveCombat = true,
@@ -1355,7 +1758,7 @@ local function readShared(path)
     local ok, data = pcall(function() return HttpService:JSONDecode(readfile(path)) end)
     if ok and type(data) == "table" and data.Version == 1 then return data end
 end
-local accountOnly = { SyncEnabled = true, SyncURL = true, SyncKey = true }
+local accountOnly = { Enabled = true, Role = true, Host = true, Carry = true, Alts = true, SyncURL = true, SyncKey = true }
 local function applyValues(values)
     for key, value in pairs(type(values) == "table" and values or {}) do
         if not accountOnly[key] and defaults[key] ~= nil and type(value) == type(defaults[key]) then C[key] = value end
@@ -1376,14 +1779,16 @@ if env.autoloadconfig ~= false then
         if type(saved.MenuKey) == "string" then menuKey = saved.MenuKey end
     end
 end
--- A teleport snapshot belongs to this account and takes precedence over shared profiles.
-if env.autoloadconfig ~= false and type(resume) ~= "table" then
+-- Role profiles own normal settings on every execute, including teleports.
+local continuationEnabled = type(resume) == "table" and C.Enabled
+if env.autoloadconfig ~= false then
     local shared = readShared(partyPath)
     local party = shared and type(shared.Party) == "table" and shared.Party or table.clone(C)
     local detected = Logic.accountRole(party, player.Name, player.UserId)
     if detected then
         local profile = readShared(profilePath(detected))
         if profile and type(profile.Config) == "table" then
+            applyValues(defaults)
             applyValues(profile.Config)
             if type(profile.MenuKey) == "string" then menuKey = profile.MenuKey end
         elseif C.Role ~= detected then
@@ -1395,7 +1800,10 @@ if env.autoloadconfig ~= false and type(resume) ~= "table" then
         if type(party[key]) == "string" then C[key] = party[key] end
     end
 end
--- Setup loaders can enable shared files alone or add a relay fallback.
+if C.AutoStartRole then C.Enabled = true
+elseif type(resume) == "table" then C.Enabled = continuationEnabled == true
+else C.Enabled = false end
+-- Setup loaders configure transport only; role auto-start and readiness are independent.
 local syncSetup = env.DQRewriteSync
 if type(syncSetup) == "table" and (syncSetup.Files == true
     or type(syncSetup.URL) == "string" and type(syncSetup.Key) == "string") then
@@ -1421,7 +1829,7 @@ Library.Scheme.AccentColor = Color3.fromRGB(63, 205, 134)
 local controller = createController()
 if controller.SetLearningData then controller.SetLearningData(runtime.AdaptiveCombat) end
 local alive, hooks, controls, errors = true, {}, {}, {}
-local coordinator, partySync
+local coordinator, partySync, boosts
 local editingParty = false
 local partyInputs = {}
 local previousFPS = type(getfpscap) == "function" and getfpscap() or nil
@@ -1551,6 +1959,7 @@ local function slider(group, key, text, min, max)
     controls[key] = control
 end
 local automation = partyTab:AddLeftGroupbox("Automation")
+toggle(automation, "AutoStartRole", "Auto start role automation on execute")
 toggle(automation, "Enabled", "Enable role automation", nil, "Starts the selected Carry, Host, or Alt role. Choose Host to create dungeons.")
 automation:AddLabel("Select your account role and fill in the party below. Host creates dungeons; carry and alts request the host.", true)
 local roleAutomation = roleTab:AddLeftGroupbox("Automation")
@@ -1566,11 +1975,12 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
 local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
-toggle(syncGroup, "SyncEnabled", "Require selected scripts ready", nil, "Uses shared executor files automatically. A configured relay is only a fallback when client workspaces are isolated.")
+toggle(syncGroup, "SyncEnabled", "Enable cross-client sync", nil, "Exchanges party phases and heartbeats. Does not enable or disable local Carry combat.")
+toggle(syncGroup, "RequireScriptsReady", "Require selected scripts ready before start", nil, "Waits for every selected heartbeat before starting. Turn off to use player presence when transport is unavailable.")
 input(syncGroup, "SyncURL", "Optional relay fallback URL")
 input(syncGroup, "SyncKey", "Private relay key")
 syncGroup:AddLabel("Same-device clients first try heartbeat files in the executor workspace. No command or local server is needed when those files are shared.", true)
-local syncLabel = syncGroup:AddLabel("Sync off", true)
+local syncLabel = syncGroup:AddLabel("Sync: checking transport", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")
 toggle(options, "Whitelist", "Private / whitelist lobby (host)")
@@ -1591,9 +2001,9 @@ slider(carry, "SpellRange", "Spell range fallback", 8, 100)
 toggle(carry, "AutoDodge", "Pathfinding hazard avoidance")
 toggle(carry, "AdaptiveCombat", "Adaptive combat policy", nil, "Learns target priority and combat spacing from local health, kill, and damage outcomes. The model stays on this account and falls back to the safe baseline until it has evidence.")
 local join = roleTab:AddLeftGroupbox("Carry and alt")
-toggle(join, "AutoJoin", "Send join requests to host")
+toggle(join, "AutoJoin", "Auto join Host")
 slider(join, "JoinInterval", "Join request interval (seconds)", 5, 60)
-toggle(join, "AutoSwitch", "Switch to best party dungeon", nil, "After a run, selects for the lowest host/alt level. Unequal XP no longer prevents switching.")
+join:AddLabel("Host Auto Best decides progression for the whole party. Carry and Alts follow the Host transition.", true)
 local host = roleTab:AddRightGroupbox("2 · Host")
 toggle(host, "AutoBest", "Create and join best eligible dungeon", nil, "Runs when this account is set to Host and role automation is enabled.")
 toggle(host, "AutoAccept", "Accept selected accounts only")
@@ -1602,6 +2012,10 @@ local support = roleTab:AddRightGroupbox("3 · Host and Alt support")
 toggle(support, "AutoHealer", "Healer loadout + Universal Heal", nil, "On Host or Alt, equips the strongest eligible mage weapon, tank helmet/chest, and up to two Universal Heals. Alternates heals when the party needs health.")
 toggle(support, "AutoSkillPoints", "Auto allocate skill points")
 dropdown(support, "UpgradeStat", "Allocate to", { "Stamina", "Spell Power", "Physical Power" })
+local boostGroup = settingsTab:AddRightGroupbox("Boosts")
+toggle(boostGroup, "AutoBuyBoosts", "Auto buy boosts with gold", nil, "x2 Gold, +1 Drop, VIP, then XP 1h/2h/4h. Server prices and daily allowances are checked. Never spends Robux or gems.")
+local boostLabel = boostGroup:AddLabel("Boosts: auto buy off", true)
+boostGroup:AddLabel("Premium or unsupported offers must be purchased manually in the game's shop.", true)
 local inventory = settingsTab:AddLeftGroupbox("All account types")
 toggle(inventory, "AutoSell", "Auto sell all rarities", nil, "Works without role automation or party setup. Keeps two Universal Heals, equipped/locked/favorite items, and armor selected for the healer loadout.")
 toggle(inventory, "KeepLegendary", "Keep legendary items", nil, "Excludes every legendary weapon, helmet, chest, and ability from Auto Sell. Saved per account; enabled by default.")
@@ -1643,14 +2057,15 @@ menu:AddButton({ Text = "Return to lobby", Func = function()
 end })
 menu:AddButton({ Text = "Unload", Func = unload })
 partySync = PartySync.new(C, MODE, function() return alive end)
+boosts = BoostManager.new(C, runtime, function() return alive end)
 coordinator = Roles.new(C, runtime, MODE, controller, save, function() return alive end, partySync)
 env.DungeonQuestObsidian = { Config = C, Runtime = runtime, Controller = controller, Coordinator = coordinator,
-    Library = Library, Sync = partySync, Unload = unload, Errors = errors, Mode = MODE }
+    Library = Library, Sync = partySync, Boosts = boosts, Unload = unload, Errors = errors, Mode = MODE }
 local teleportQueued = false
 connect(player.OnTeleport, function(state)
     if state == Enum.TeleportState.Failed then teleportQueued = false; coordinator.TeleportFailed(); return end
     if state ~= Enum.TeleportState.Started then return end
-    coordinator.Stop(); save()
+    coordinator.TeleportStarted(); save()
     if env.autoexecute == false or teleportQueued or type(queueTeleport) ~= "function" then return end
     local url = env.DQObsidianLoaderURL or "https://raw.githubusercontent.com/glitchreal/dungeonquestrewrite/main/main.luau"
     local queued = string.format("getgenv().autoexecute=true\ngetgenv().autoloadconfig=%s\ngetgenv().DQRewriteResume=game:GetService('HttpService'):JSONDecode(%q)\nassert(loadstring(game:HttpGet(%q)))()",
@@ -1694,10 +2109,12 @@ task.spawn(function()
             coordinator.status = "Blocked: " .. reason:gsub("^.-:%d+: ", "")
         else errors.Automation = nil end
         saveLabel:SetText(errors.Save or errors.Profile or ("Profile: " .. C.Role .. " | Account: " .. player.Name))
+        boosts.Tick(os.clock())
+        boostLabel:SetText(boosts.status)
         syncLabel:SetText(partySync.status)
         roleStatusLabel:SetText(C.Role .. " · " .. coordinator.status)
         sellLabel:SetText(coordinator.sellStatus)
-        statusLabel:SetText(C.Role .. " · " .. coordinator.status)
+        statusLabel:SetText(C.Role .. " · " .. coordinator.phase .. " · " .. coordinator.status)
         partyLabel:SetText(coordinator.party)
         levelLabel:SetText("Level: " .. tostring(Adapter.level() or "loading") .. " | " .. controller.State.status)
         errorLabel:SetText(errors.Automation or errors.Save or "")

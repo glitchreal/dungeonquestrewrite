@@ -24,6 +24,7 @@ for _, route in ipairs({ "lobby", "dungeon" }) do
         module("AdaptivePolicy", "src/AdaptivePolicy.luau"),
         module("PartySync", "src/PartySync.luau"),
         module("Roles", "src/RoleController.luau"),
+        module("BoostManager", "src/BoostManager.luau"),
     }
     if route == "dungeon" then
         table.insert(parts, module("ThreatGeometry", "src/ThreatGeometry.luau"))

@@ -16,9 +16,10 @@ host username, carry username, and selected alt usernames on all accounts.
 Paste the whole alt list using newlines, spaces, tabs, commas, or semicolons, then
 press Enter or click away. The field formats it with commas and removes duplicate entries.
 User IDs also work; display names do not. Select each account's
-role, choose its options, then use **Enable role automation** at the top of Party
-or **Start selected role** at the top of Roles. Dungeon creation requires the
-**Host** role; Carry and Alt send join requests instead. Party fields save as
+role, choose its options, and enable **Auto start role automation on execute** in each
+role profile for unattended execution. **Enable role automation** and **Start selected
+role** still control the current session. Dungeon creation requires the
+**Host** role; Carry and Alt join the Host queue, or send requests only to a Host confirmed in PRE_START. Party fields save as
 you type, and the visible text is captured again before reload/unload/teleport.
 Role automation pauses while you edit the party to avoid using partial usernames.
 Click away to resume; Enter is optional. The host and carry must
@@ -32,7 +33,7 @@ turning on its own toggle runs it even with role automation off or no party conf
 
 | Role | Behavior |
 | --- | --- |
-| Carry | Sends requests to the host. Level Kaitun waits for the entire selected party, starts the dungeon, then uses the existing pathfinding combat farm. Pauses whenever a selected account is absent or its level is unavailable. |
+| Carry | Joins the Host, waits for the actual dungeon start, and runs the local pathfinding farm when the selected party is present. Script heartbeats do not gate running combat. |
 | Host | Creates and enters the best eligible dungeon, accepts requests only from the resolved selected accounts, and replays. Starts once everyone is present; keep Level Kaitun on for the host too, so owner-restricted starts work. |
 | Alt | Sends requests to the host. Optional healer support matches the Host behavior below. |
 | Host and Alt healer support | Equips the strongest eligible mage weapon, highest-level tank helmet/chest, and up to two Universal Heals, removes other equipped skills, and casts only Universal Heal when a selected member needs health. Optional skill points go to Stamina, Spell Power, or Physical Power. |
@@ -55,62 +56,85 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
   Unresolved prompts are retried at most once every five seconds.
 - Before starting, every selected account must be present in the same dungeon.
   Readable matching non-carry levels are required for progression, not starting. The configurable party-ready delay gives arrivals time to settle.
-- At the end of a run, switching waits five seconds for rewards and chooses using
-  the lowest current host/alt level. Unequal XP does not hold the party in an old
-  dungeon, and the lower account is never sent above its requirement. The host
-  returns to create the new dungeon; carry/alt accounts return and request the host
-  again. Enable Auto Best on the host and Auto Switch on the carry/alts.
-- Starting and recovery do not depend on dungeon-owner metadata. Host role
-  controls join-request handling; the game enforces owner-only actions.
-- A host disappearing is **not** treated as a level unlock. With OCD disabled, the
-  carry pauses and waits. Initial party assembly has no timeout. With OCD enabled
-  on every account, a player missing from a previously assembled party (or an
-  already-started run) for the grace period triggers lobby recovery. Requests and teleports are retried at bounded intervals.
-- Recovery remembers observed alt levels and caps the host's new selection at the
-  lowest known non-carry level so a disconnected alt is not locked out. It cannot undo XP earned before a disconnect or
-  guarantee identical XP/levels when account XP boosts differ.
+- The coordinator uses explicit LOBBY_REFORMING, ASSEMBLING, PRE_START, RUNNING,
+  REWARDS_SETTLING, REPLAYING, PROGRESSION_RETURN, and RECOVERING phases.
+- Completion is latched from the completion event, GUI, boss state, or progress.
+  After five seconds for rewards (plus heal inspection when configured), **only
+  the Host** chooses replay versus progression using the lowest Host/Alt level.
+  Missing dungeon metadata does not count as an unlock. The same eligible dungeon
+  replays with the party intact; there is no routine return or new join request.
+- Replay uses the inspected ReplayDungeonButton payload and `replayDungeon` event.
+  Three bounded attempts precede a controlled regroup if teleport never starts.
+  Teleport-in-progress suppresses duplicate actions. Same-job reloads preserve
+  pending transition attempts; new jobs discard the old transition context.
+- A better eligible dungeon (or completed healer provisioning) causes one Host
+  progression-return decision. Followers consume its command once. Return retries
+  use bounded backoff; they do not stack a separate reward delay on each account.
+- Host accepts selected requests only in PRE_START, before it has ever observed
+  this job running, and while completion, failure, return, and teleport are absent.
+  Completed/running Hosts reject stale requests even if the started flag falls.
+- Followers request a dungeon Host only with fresh PRE_START sync evidence and a
+  job different from their previous dungeon. Without that evidence, they use the
+  game's local/global **lobby queue** interfaces. Host waits for selected queue
+  members before entry, so presence-only coordination does not need blind requests
+  into a potentially completed dungeon. Global discovery checks the expected map
+  and rotates through the catalog when accounts have different cached selections.
+- OCD arms only after the entire party, including level data, has been observed
+  in the same stable phase. Initial arrivals have no timeout. A continuously missing
+  member starts RecoveryGrace; reappearance resets it. Replay, return, teleport,
+  and fresh lobby assembly suspend that timer. Carry pauses immediately on absence.
+  Host announces recovery; Carry can take authority if Host is genuinely absent.
+  Without transport, Host departure is the fallback signal; a 30-second teleport
+  grace distinguishes a delayed replay from a return when no explicit decision
+  can be read. Confirmed progression commands return immediately.
+- Recovery retains observed non-carry levels as eligibility ceilings. It cannot
+  undo earned XP or equalize accounts with different XP boosts.
 
 ## Optional cross-client sync
 
-Cross-client sync reports that every selected **script** is running, not merely
-that each player is present. On one device, use `files.luau` on every account or
-enable **Require selected scripts ready** in Party. No relay, key, command, port,
-or background process is required when the executor clients share one workspace.
+Three independent settings control execution:
 
-- Each account writes only its own heartbeat file every 0.25 seconds. Readers
-  require all fresh heartbeats to name the same dungeon job and place, and to report
-  enabled and ready. Brief partial writes are ignored until the next heartbeat.
-- The host writes one job-scoped regroup command before leaving. Carry and alts
-  read it directly and follow; commands expire after 30 seconds and cannot eject a
-  newly teleported party from a different job.
-- Stale heartbeat files are harmless and may remain on disk. Timestamps and job IDs
-  prevent them from authorizing a future start. No client enumerates arbitrary
-  workspace content because roster IDs determine the exact files to read.
-- Once every account's heartbeat has been observed, the script stays on file sync
-  and fails closed if one becomes stale, disabled, paused, or moves to another job.
-- Some executors isolate each Roblox process in a separate virtual workspace. Until
-  shared files are proven, a configured HTTP relay remains an automatic fallback.
-  Without either path, the UI reports that sync is unavailable instead of starting.
-- Disabling sync restores presence-only behavior. Sync cannot inject or execute the
-  loader on another account, so run it on each account and keep teleport execution enabled.
+- **Auto start role automation on execute**: saved in each Carry/Host/Alt profile.
+- **Enable cross-client sync**: exchanges phases, heartbeats, and transitions.
+- **Require selected scripts ready before start**: gates starting the dungeon,
+  never Carry movement in an already-running dungeon.
 
-An optional private relay loader can still set
+`files.luau` enables file transport only. Shared executor files are checked first;
+configured HTTP relay is a fallback. A missing heartbeat reports the account, and
+an unproven shared workspace reports possible isolation/relay unavailability.
+With script readiness disabled, unavailable transport uses presence-only policy.
+With script readiness required, the Host waits and shows the missing evidence.
+No setting executes scripts on other accounts; run the loader on each account.
+
+Heartbeats write every 0.25 seconds. Relay requests run separately so HTTP latency
+cannot stop file heartbeats. A transition has a unique ID, authority, source job,
+place, dungeon context, phase, timestamp, and fixed 90-second expiry. Repeated
+announcements do not extend it; old-job, wrong-authority, legacy, and expired
+commands are ignored. Followers persist the consumed ID. Host normally owns
+transitions; Carry recovery requires Host absence. Shared profiles/files require
+an actually shared executor workspace, not just the same computer/HWID.
+
+Optional relay configuration remains:
 `getgenv().DQRewriteSync = { URL = "https://YOUR-RELAY.workers.dev", Key = "YOUR-PRIVATE-KEY" }`.
-Never commit or publicly share a real relay key. File sync takes priority if the
-workspace proves shared, so existing relay-enabled loaders gain the faster path too.
+Do not publish a real relay key. The Cloudflare Worker and local server are in
+[`src/relay`](src/relay/README.md). Existing deployments need the updated relay code
+for phase/epoch coordination; outdated relays fall back to lobby/presence policy.
+Run `npm run local` there for native desktop clients using `http://127.0.0.1:8788`
+or an emulator's host address. Cloudflare uses the existing free-plan configuration.
 
-The deployable Cloudflare Worker is in [`src/relay`](src/relay/README.md). It uses a
-SQLite-backed Durable Object supported by the Workers Free plan. Ten continuously
-running accounts at the default interval use about 86,400 requests/day, before
-restarts and other traffic; the Free plan allowance is 100,000/day. Stay on Free:
-exceeding its quota stops requests rather than automatically buying extra capacity.
+## Boosts
 
-If files are isolated but local HTTP is available, run `npm run local` inside
-`src/relay`. Use
-`http://127.0.0.1:8788` for native desktop Roblox clients. Android emulators commonly
-reach the host at `http://10.0.2.2:8788`; otherwise use the host computer's private
-LAN address. The local server uses the same ignored `.dev.vars` key as Cloudflare,
-stores only short-lived memory, and needs to remain open while the accounts run.
+**Auto buy boosts with gold** is opt-in and saved by role. The inspected game shop
+currently offers x2 Gold, +1 Item (shown here as +1 Drop), and VIP through gold-only
+interfaces; prices vary with level and are queried rather than hardcoded. Priority
+is x2 Gold, +1 Drop, VIP, then XP 1h, 2h, 4h. Later XP tiers wait until earlier tiers
+are exhausted/unavailable according to the server's current allowance/cooldown.
+Saved offers are observations only; a local calendar date never authorizes buying.
+
+Only one purchase can be requested per 15-second inspection cycle, followed by a
+fresh ownership/allowance check. Gold affordability is checked first. Robux, gems,
+and unknown currencies are never purchased automatically; status directs the user
+to the game's shop for manual purchases. No premium prompt/confirmation is invoked.
 
 ## Healer provisioning and selling
 
@@ -136,10 +160,9 @@ separated by commas, semicolons, or pasted lines, for example
 `Enhanced Inner Focus, Enhanced Inner Rage`. Matching ignores capitalization and
 extra spaces but requires the entire name; every matching copy is protected.
 Editing the list stops Auto Sell so partially typed names cannot cause a sale.
-Re-enable Auto Sell when finished. The list saves automatically in the same
-per-account config, including across teleports.
+Re-enable Auto Sell when finished. The list saves automatically in the role profile and account continuation, including across teleports.
 
-**Keep legendary items** is enabled by default and saves per account. It excludes
+**Keep legendary items** is enabled by default and saves in the role profile. It excludes
 all legendary weapons, helmets, chests, and abilities from selling. Turn it off
 to include legendary items, subject to the other keep rules.
 
@@ -150,7 +173,7 @@ refreshed after equipping before a sale is computed. Trading pauses inventory
 mutations. All equipped ability slots, including Q2/E2, are protected; unknown
 equipped status is also kept. The sale readout distinguishes requests from items
 confirmed removed by the next inventory scan. Auto Sell is intentionally opt-in
-on each account and requires neither party setup nor dungeon catalog loading.
+in each role profile and requires neither party setup nor dungeon catalog loading.
 
 ## Settings and execution
 
@@ -169,8 +192,9 @@ Files in the executor workspace:
 - `DungeonQuestRewrite-sync/<party-id>/command.json`: short-lived host regroup command.
 
 Role profiles publish on user edits. Periodic saves and teleports update only the
-account file, so idle accounts do not overwrite shared settings. An in-memory
-teleport snapshot takes precedence over shared profiles on arrival. An existing
+account file, so idle accounts do not overwrite shared settings. Shared role settings take precedence over stale account settings and teleport
+snapshots. Runtime observations and the current session’s enabled state continue
+through teleport; AutoStartRole also enables fresh execution. An existing
 account config seeds a missing role profile when its party identifies that account.
 Party text saves while typing and is captured again before unload/teleport.
 Role automation pauses during party edits to avoid using unfinished usernames.
@@ -178,10 +202,16 @@ Accounts must share the executor's file workspace to share profiles; the same HW
 alone does not make separate executor folders share files. `autoloadconfig = false`
 starts with defaults and skips shared profiles too.
 
-From Ghastly Harbor through Northern Lands, combat navigation follows each map's
-ordered room checkpoints whenever an enemy is replicated behind walls. Visible
-enemies take priority over stale through-wall target locks, preventing the carry
-from circling adjacent rooms or repeatedly walking into a locked doorway.
+From Ghastly Harbor through Northern Lands, navigation follows ordered room
+checkpoints. Checkpoints require proximity on the same floor; a 60-stud height
+gap no longer advances stairs prematurely. Streaming refreshes preserve visited
+rooms and include newly replicated forward checkpoints. Brief role pauses retain
+route progress. Empty/cleared rooms advance toward the next checkpoint.
+Visible enemies outrank blocked targets for every adaptive strategy. A lightweight
+watchdog tracks checkpoint/dungeon progress, target health, kills, and closing
+distance; stalls invalidate inaccessible targets and recompute the route using
+ordinary walking. Northern Lands policy is localized in the map table. No large
+teleports or new movement controller were added; tactical dodge limits are intact.
 
 Combat also includes an optional local adaptive policy, enabled by default under
 Carry → Adaptive combat policy. It is a small contextual bandit, not a remote
@@ -212,7 +242,7 @@ Unsupported places exit without running automation.
 
 `src/HubLogic.luau` contains pure eligibility, roster, equipment, and sale policy.
 `src/GameAdapter.luau` owns inspected game interfaces. `src/RoleController.luau`
-coordinates the three roles. `src/ObsidianHub.luau` owns UI, lifecycle, settings,
+coordinates the three roles. `src/BoostManager.luau` owns bounded purchase policy. `src/ObsidianHub.luau` owns UI, lifecycle, settings,
 and performance. Combat, ability scheduling, farm planning, and threat geometry
 remain separate modules.
 

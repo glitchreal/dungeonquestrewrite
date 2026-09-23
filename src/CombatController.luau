@@ -15,7 +15,7 @@ local ROUTE_GUIDED_DUNGEONS = {
     ["Volcanic Chambers"] = true,
     ["Aquatic Temple"] = true,
     ["Enchanted Forest"] = true,
-    ["Northern Lands"] = true,
+    ["Northern Lands"] = { reach = 12, height = 10, watchdog = 12 },
 }
 
 local CFG = {
@@ -393,44 +393,64 @@ end
 -- These long, folded maps replicate enemies through walls before their room
 -- opens. Follow the map's own ordered checkpoints instead of aiming directly
 -- through locked doors or at a vertically adjacent room.
-local function refreshRouteAnchors()
+local hasBlockingRay
+local function routePolicy()
+    local policy = ROUTE_GUIDED_DUNGEONS[dungeonName()]
+    return type(policy) == "table" and policy or { reach = 12, height = 10, watchdog = 15 }
+end
+local function refreshRouteAnchors(force)
     local name = dungeonName()
-    if state.routeDungeon == name and (#state.routeAnchors > 0 or not ROUTE_GUIDED_DUNGEONS[name]) then return end
+    if not force and state.routeDungeon == name and os.clock() - (state.routeScanAt or 0) < 2 then return end
+    local oldDungeon = state.routeDungeon
     state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = name, {}, 1
+    state.routeScanAt = os.clock()
+    if oldDungeon ~= name then state.routePassed, state.routePassedOrder = {}, nil end
+    state.routePassed = state.routePassed or {}
     if not ROUTE_GUIDED_DUNGEONS[name] then return end
     local dungeon = Workspace:FindFirstChild("dungeon")
     if not dungeon then return end
-    for _, instance in ipairs(dungeon:GetDescendants()) do
-        if instance:IsA("BasePart") and instance.Name:lower() == "checkpoint" then
-            local room = instance.Parent and instance.Parent.Name or ""
-            local number = tonumber(room:lower():match("room(%d+)"))
-            local order = number or (room:lower():find("boss", 1, true) and 1000 or 900)
-            table.insert(state.routeAnchors, { part = instance, order = order, name = room })
+    for _, instance in ipairs(dungeon:QueryDescendants("BasePart")) do
+        if instance.Name:lower() == "checkpoint" then
+            local room = instance.Parent
+            while room and room.Parent ~= dungeon do room = room.Parent end
+            local roomName = room and room.Name or instance.Parent.Name
+            local number = tonumber(roomName:lower():match("room[%s_%-]*(%d+)"))
+            local order = number or (roomName:lower():find("boss", 1, true) and 1000 or 900)
+            table.insert(state.routeAnchors, { part = instance, order = order, name = roomName, key = instance:GetFullName() })
         end
     end
     table.sort(state.routeAnchors, function(a, b)
-        return a.order < b.order or a.order == b.order and a.name < b.name
+        return a.order < b.order or a.order == b.order and a.key < b.key
     end)
+    -- Retain visited rooms, but include newly streamed checkpoints ahead of them.
+    for index, anchor in ipairs(state.routeAnchors) do
+        if state.routePassed[anchor.key] or anchor.order < (state.routePassedOrder or -math.huge) then
+            state.routeAnchorIndex = index + 1
+        else break end
+    end
 end
 
 local function mapRouteGoal(rootPart)
     refreshRouteAnchors()
+    local policy = routePolicy()
+    -- Reacquire only a nearby checkpoint on the same floor with clear sight.
+    -- This handles reloads/recovery without skipping across folded rooms.
+    for index = state.routeAnchorIndex, #state.routeAnchors do
+        local anchor = state.routeAnchors[index]
+        local delta = rootPart.Position - anchor.part.Position
+        if Vector3.new(delta.X, 0, delta.Z).Magnitude <= policy.reach and math.abs(delta.Y) <= policy.height
+            and not hasBlockingRay(rootPart.Position, anchor.part.Position + Vector3.new(0, 2.5, 0), rootPart.Parent) then
+            for passed = state.routeAnchorIndex, index do state.routePassed[state.routeAnchors[passed].key] = true end
+            state.routePassedOrder = anchor.order
+            state.routeAnchorIndex = index + 1
+        end
+    end
     while true do
         local anchor = state.routeAnchors[state.routeAnchorIndex]
         if not anchor then return nil end
-        if not anchor.part.Parent then
-            state.routeDungeon = nil
-            refreshRouteAnchors()
-            anchor = state.routeAnchors[state.routeAnchorIndex]
-            if not anchor then return nil end
-        end
-        local delta = rootPart.Position - anchor.part.Position
-        local flat = Vector3.new(delta.X, 0, delta.Z).Magnitude
-        if flat <= 28 and math.abs(delta.Y) <= 60 then
+        if not anchor.part.Parent or state.routePassed[anchor.key] then
             state.routeAnchorIndex = state.routeAnchorIndex + 1
-        else
-            return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor
-        end
+        else return anchor.part.Position + Vector3.new(0, 2.5, 0), anchor end
     end
 end
 
@@ -481,8 +501,6 @@ local function refreshTargets(rootPart, now)
     state.cachedTargets = targets
 end
 
-local hasBlockingRay
-
 local function getClosestEnemy(rootPart, now)
     refreshTargets(rootPart, now)
     if now - (state.lastTargetChoice or 0) < 0.15 and isValidTarget(state.lockedTarget) then
@@ -498,7 +516,7 @@ local function getClosestEnemy(rootPart, now)
         if isValidTarget(model) and model:IsDescendantOf(Workspace) then
             local root = getRootPart(model)
             local distance = (rootPart.Position - root.Position).Magnitude
-            if distance <= CFG.DETECTION_RADIUS then
+            if distance <= CFG.DETECTION_RADIUS and now >= (state.inaccessibleTargets and state.inaccessibleTargets[model] or 0) then
                 table.insert(candidates, { model = model, root = root, distance = distance })
             end
         end
@@ -507,10 +525,9 @@ local function getClosestEnemy(rootPart, now)
     -- nearest engagement ring, and doing the same here avoids raycasting every
     -- replicated enemy on large waves while retaining enough context for AoE.
     table.sort(candidates, function(a, b) return a.distance < b.distance end)
-    local searchDistance = candidates[1] and math.max(CFG.THREAT_RADIUS, candidates[1].distance + 24) or 0
     local shortlist = {}
     for index, candidate in ipairs(candidates) do
-        if index > 24 or candidate.distance > searchDistance then break end
+        if index > 48 then break end
         table.insert(shortlist, candidate)
     end
     candidates = shortlist
@@ -532,6 +549,7 @@ local function getClosestEnemy(rootPart, now)
         candidate.score = targetScore(candidate, strategy)
     end
     table.sort(candidates, function(a, b)
+        if a.visible ~= b.visible then return a.visible end
         if a.score == b.score then return a.distance < b.distance end
         return a.score < b.score
     end)
@@ -543,7 +561,7 @@ local function getClosestEnemy(rootPart, now)
     -- Hysteresis: two far targets in opposite directions flip-flop the lock
     -- every step and the bot paces between them forever. Only switch when the
     -- challenger is clearly closer or the lock is invalid/gone.
-    if previousLock and previousLock ~= state.lockedTarget and isValidTarget(previousLock)
+    if previousLock and previousLock ~= state.lockedTarget and now >= (state.inaccessibleTargets and state.inaccessibleTargets[previousLock] or 0) and isValidTarget(previousLock)
         and previousLock:IsDescendantOf(Workspace) then
         local lockedRoot = getRootPart(previousLock)
         if lockedRoot then
@@ -2103,6 +2121,42 @@ local function handleSafety(humanoid, rootPart, target, targetRoot, now)
     return true
 end
 
+-- Counts actual objective/health progress, not lateral motion around a wall.
+local function progressWatchdog(rootPart, target, now, routeGoal, routeAnchor)
+    local hp = target and target:FindFirstChildOfClass("Humanoid")
+    local root = target and getRootPart(target)
+    local visible = root and not hasBlockingRay(rootPart.Position, root.Position, rootPart.Parent, target)
+    local objective = visible and root.Position or routeGoal
+    local distance = objective and (rootPart.Position - objective).Magnitude or math.huge
+    local progressValue = Workspace:FindFirstChild("dungeonProgress")
+    local progress = progressValue and progressValue.Value
+    local checkpoint = routeAnchor and routeAnchor.key
+    local watch = state.progressWatch
+    if not watch then
+        watch = { at = now, distance = distance }
+        state.progressWatch = watch
+    end
+    if watch.checkpoint ~= checkpoint or watch.progress ~= progress or watch.kills ~= state.kills
+        or visible and watch.target ~= target
+        or hp and watch.target == target and hp.Health < (watch.hp or hp.Health)
+        or distance < watch.distance - 2 then
+        watch.at, watch.distance = now, distance
+    end
+    watch.checkpoint, watch.progress, watch.kills = checkpoint, progress, state.kills
+    watch.target, watch.hp = target, hp and hp.Health
+    if now - watch.at < routePolicy().watchdog then return end
+    watch.at, watch.distance = now, math.huge
+    if target and not visible then
+        state.inaccessibleTargets = state.inaccessibleTargets or setmetatable({}, { __mode = "k" })
+        state.inaccessibleTargets[target] = now + 6
+    end
+    state.lockedTarget, state.currentTarget, state.motionGoal, state.fallbackGoal = nil, nil, nil, nil
+    state.lastTargetChoice, state.pathUpdateTime, state.routeFails = 0, 0, 0
+    clearPath()
+    refreshRouteAnchors(true)
+    state.pathStatus = "Progress watchdog: reacquiring reachable route objective"
+end
+
 local function controllerTick()
     if not state.running or state.closed then return end
     local character, humanoid, rootPart = getChar()
@@ -2146,7 +2200,9 @@ local function controllerTick()
             state.prevHealth[model] = trackedHumanoid.Health
         end
     end
+    local routeGoal, routeAnchor = mapRouteGoal(rootPart)
     local target, distance = getClosestEnemy(rootPart, now)
+    progressWatchdog(rootPart, target, now, routeGoal, routeAnchor)
     if not target then
         finishAdaptiveTarget(now, state.adaptiveTarget and not isValidTarget(state.adaptiveTarget.target) or false)
         state.castAimTarget, state.farmPlan, state.groupCount = nil, nil, 0
@@ -2154,8 +2210,14 @@ local function controllerTick()
         state.escapeGoal, state.lastThreatPart = nil, nil
         state.status, state.targetName, state.targetDist = "Waiting for wave", "None", 0
         state.currentTarget, state.lockedTarget = nil, nil
-        stopMovement(humanoid, rootPart)
-        state.pathStatus = "Pathfinding: waiting for next wave"
+        if routeGoal then
+            state.status = "Advancing cleared room: " .. routeAnchor.name
+            followGoal(humanoid, rootPart, routeGoal, "map-route", now)
+            updateProgress(humanoid, rootPart, routeGoal, nil, now)
+        else
+            stopMovement(humanoid, rootPart)
+            state.pathStatus = "Pathfinding: waiting for next wave"
+        end
         return
     end
 
@@ -2193,25 +2255,6 @@ local function controllerTick()
     end
     state.currentTarget, state.targetName, state.targetDist = target, target.Name, distance
     if state.adaptiveTarget then state.adaptiveTarget.lastHealth = targetHumanoid.Health end
-    -- Doomed round: same target for 3 minutes with zero kills and zero damage
-    -- dealt (e.g. mob under the map behind a wall that never opens). Solo
-    -- only, so nobody else's run is ever touched. Leaves via teleToLobby.
-    do
-        local dw = state.doomWatch
-        local hp = targetHumanoid and targetHumanoid.Health or 0
-        if not dw or dw.target ~= target then
-            state.doomWatch = { target = target, since = now, kills = state.kills, hp = hp }
-        elseif now - dw.since >= 180 and state.kills == dw.kills and hp >= dw.hp and not state.doomFired then
-            if #Players:GetPlayers() <= 1 then
-                state.doomFired = true
-                logThreat("doomed", target.Name)
-                warn("[EnemyWalker] doomed round, leaving: " .. target.Name)
-                pcall(function()
-                    game:GetService("ReplicatedStorage"):WaitForChild("remotes"):WaitForChild("teleToLobby", 5):FireServer()
-                end)
-            end
-        end
-    end
     local protectorRear = target.Name == "Ancient Temple Protector"
     local protectorApproach
     if protectorRear then
@@ -2495,8 +2538,8 @@ local function setRunning(running)
         state.stuckStartTime, state.stuckCount, state.pathUpdateTime = 0, 0, 0
         state.routeFails, state.wanderGoal, state.wanderUntil = 0, nil, 0
         state.wallSide, state.wallVisits, state.wallFlips = nil, {}, 0
-        state.routeDungeon, state.routeAnchors, state.routeAnchorIndex = nil, {}, 1
-        state.doomWatch, state.doomFired = nil, nil
+        -- A short party pause must not send the carry back to the first room.
+        state.progressWatch, state.inaccessibleTargets, state.routeScanAt = nil, nil, nil
         state.lastDodgeThreat, state.lastDodgeThreatAt = nil, 0
         state.dodgeCount, state.damageEvents, state.lastPlayerHealth = 0, 0, nil
         state.adaptiveTarget, state.targetStrategy = nil, "visible"

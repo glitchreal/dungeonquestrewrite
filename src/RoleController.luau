@@ -3,7 +3,7 @@ local Roles = {}
 function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local player = game:GetService("Players").LocalPlayer
     local Players = game:GetService("Players")
-    local state = { sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
+    local state = { phase = mode == "Lobby" and "LOBBY_REFORMING" or "ASSEMBLING", phaseAt = os.clock(), sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
         finished = false, finishedAt = nil, missingAt = nil, readyAt = nil, returning = false, requests = {}, responded = {} }
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
     local rosterKey, catalogReady = nil, false
@@ -17,6 +17,9 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     end
     runtime.Levels = runtime.Levels or {}
     local revision, tickRevision = 0, 0
+    local function wallTime()
+        return DateTime and DateTime.now().UnixTimestampMillis / 1000 or os.time()
+    end
     local function current() return isAlive() and revision == tickRevision end
     local function active() return current() and config.Enabled end
     local function healerRole() return config.Role == "Host" or config.Role == "Alt" end
@@ -29,22 +32,64 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         state.farming = false
         controller.SetRunning(false)
     end
-    local function returnLobby(reason, now)
-        stop()
-        state.returning, state.status = true, reason
-        if sync and not sync.Regroup(reason) then
-            state.status = "Waiting for relay to announce regroup"
-            return
+    local function phase(value, now)
+        if state.phase ~= value then
+            state.phase, state.phaseAt = value, now
+            state.missingAt, state.readyAt, state.stableAt, state.partySeen = nil, nil, nil, false
         end
-        if due("return", 15, now) and active() then save(); Adapter.call("teleToLobby") end
+        if sync then sync.SetPhase(value, Adapter.currentDungeon()) end
+    end
+    local function beginTransition(value, reason, now, command)
+        stop()
+        phase(value, now)
+        state.status, state.transitionAt = reason, now
+        local authority = config.Role == "Host" or config.Role == "Carry" and host
+            and not Players:GetPlayerByUserId(host.id) and value == "RECOVERING"
+        state.transition = command or (authority and sync and sync.NewCommand(value, reason))
+        state.transitionLocal = command == nil and authority
+        state.returning = value ~= "REPLAYING"
+        state.returnReason = reason
+        if state.transition then
+            runtime.Transition = state.transition
+            runtime.ConsumedTransition = state.transition.id
+        end
+    end
+    local function announced(now)
+        if not state.transitionLocal or not sync or not state.transition then return true end
+        if sync.Announce(state.transition) then return true end
+        -- A dead transport must not strand a completed host. Followers can use
+        -- the host's departure as presence-only evidence after this bounded window.
+        local wait = config.SyncURL ~= "" and 10 or 1
+        return now - state.transitionAt >= wait
+    end
+    local function returnLobby(reason, now, value, command)
+        if not state.returning then beginTransition(value or "RECOVERING", reason, now, command) end
+        stop()
+        state.status = state.returnReason
+        if not announced(now) then state.status = "Announcing party return"; return end
+        local attempts = state.returnAttempts or 0
+        local interval = math.min(30, 3 * 2 ^ math.min(attempts, 4))
+        if due("return", interval, now) and active() then
+            state.returnAttempts = attempts + 1
+            runtime.PendingAction = { jobId = game.JobId, phase = state.phase, attempts = state.returnAttempts, at = wallTime() }
+            save()
+            local ok, result = pcall(Adapter.call, "teleToLobby")
+            state.status = ok and result ~= false and "Return requested; waiting for teleport"
+                or ("Return failed; retrying in " .. interval .. "s")
+        end
     end
     local function configure()
         local key = table.concat({ config.Role, config.Host, config.Carry, config.Alts }, "|")
         if key ~= rosterKey then
             local newRoster, newHost, newCarry = Adapter.roster(config)
             if not active() then return false end
+            if rosterKey then
+                state.transition, state.transitionAt, state.returnAttempts, state.replayAttempts = nil, nil, nil, nil
+                table.clear(times)
+            end
             roster, host, carry, rosterKey = newRoster, newHost, newCarry, key
             state.missingAt, state.readyAt, state.returning, state.partySeen = nil, nil, false, false
+            state.stableAt = nil
             healCache = {}
             state.party = "Host: " .. host.name .. " | Carry: " .. carry.name .. " | " .. (#roster - 2) .. " selected alts"
         end
@@ -193,9 +238,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
         end
     end
+    local function joinable()
+        local owner = Adapter.ownerId()
+        return mode == "Dungeon" and state.phase == "PRE_START" and not state.finished
+            and not state.returning and not state.runStarted and not state.teleportAt and Adapter.started() == false
+            and not Adapter.finished() and not Adapter.failed() and (not owner or owner == player.UserId)
+    end
     local function processRequests(now)
-        if config.Role ~= "Host" or not config.AutoAccept or Adapter.PlaceManager.HasDungeonStarted() then return end
-        -- Recover prompts whose showJoinRequest event fired before this script loaded.
+        if config.Role ~= "Host" then return end
         if due("requestScan", 1, now) then
             for _, pending in ipairs(Adapter.pendingRequests()) do
                 if not state.requests[pending.id] and now - (state.responded[pending.id] or -math.huge) >= 5 then
@@ -204,16 +254,17 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
         end
         for id, request in pairs(state.requests) do
-            if now - request.at > 45 or request.prompt and not request.prompt.Parent then state.requests[id] = nil
-            elseif config.Role == "Host" and config.AutoAccept and not Adapter.PlaceManager.HasDungeonStarted() then
+            if request.prompt and not request.prompt.Parent then state.requests[id] = nil
+            elseif now - (state.responded[id] or -math.huge) >= 5 then
                 local allowed = false
-                for _, account in ipairs(roster) do
-                    if request.name:lower() == account.name:lower() and account.id ~= host.id then allowed = true; break end
+                if config.AutoAccept and joinable() and now - request.at <= 45 then
+                    for _, account in ipairs(roster) do
+                        if request.name:lower() == account.name:lower() and account.id ~= host.id then allowed = true; break end
+                    end
                 end
                 if active() then
-                    Adapter.call("respondJoinRequest", id, allowed)
-                    state.responded[id] = now
-                    state.requests[id] = nil
+                    state.responded[id], state.requests[id] = now, nil
+                    Adapter.call("respondJoinRequest", id, allowed and joinable())
                 end
             end
         end
@@ -228,16 +279,31 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     function state.Finish(failed)
         state.failed = state.failed or failed == true
         state.finished, state.finishedAt = true, state.finishedAt or os.clock()
+        if not state.transition then phase("REWARDS_SETTLING", state.finishedAt) end
         stop()
     end
+    function state.TeleportStarted()
+        state.teleportAt = os.clock()
+        stop()
+        if sync then sync.Pause() end
+    end
     function state.TeleportFailed()
-        state.status = "Teleport failed; retrying"
-        times["return"], times["queue"], times["replay"] = nil, nil, nil
+        state.teleportAt = nil
+        state.status = "Teleport failed; bounded retry pending"
+        -- Retain attempt timestamps: failure callbacks must not bypass rate limits.
     end
     function state.Stop() revision = revision + 1; stop(); if sync then sync.Pause() end end
     function state.Tick(now)
         tickRevision = revision
         if not isAlive() then return end
+        if state.teleportAt then
+            stop()
+            if now - state.teleportAt < 30 then state.status = "Party teleport in progress"; return end
+            state.teleportAt = nil
+        end
+        if mode == "Dungeon" then
+            if Adapter.failed() then state.Finish(true) elseif Adapter.finished() then state.Finish() end
+        end
         if not Adapter.level() then
             stop(); state.status = "Waiting for player data"
             state.sellStatus = config.AutoSell and "Auto sell: waiting for player data" or "Auto sell: off"
@@ -251,7 +317,24 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
         end
         state.status = "Checking party setup"
         if not configure() then return end
-        if sync then sync.Update(roster, host, carry, true, runtime.Heals[tostring(player.UserId)]) end
+        if not state.restored then
+            state.restored = true
+            local saved = runtime.Transition
+            if mode == "Dungeon" and Logic.validCommand(saved, host.id, carry.id, game.JobId, game.PlaceId,
+                wallTime(), not Players:GetPlayerByUserId(host.id)) then
+                beginTransition(saved.phase, saved.reason, now, saved)
+                state.transitionLocal = saved.authorId == player.UserId
+                state.transitionAt = now - math.max(0, wallTime() - saved.at)
+                local action = runtime.PendingAction
+                if type(action) == "table" and action.jobId == game.JobId and action.phase == saved.phase
+                    and type(action.at) == "number" and type(action.attempts) == "number" then
+                    local key = saved.phase == "REPLAYING" and "replay" or "return"
+                    times[key] = now - math.max(0, wallTime() - action.at)
+                    if key == "replay" then state.replayAttempts = action.attempts else state.returnAttempts = action.attempts end
+                end
+            end
+        end
+        if sync then sync.Update(roster, host, carry, true, runtime.Heals[tostring(player.UserId)], state.phase, Adapter.currentDungeon()) end
         if mode == "Lobby" and not catalogReady then
             state.status = "Loading dungeon requirements"
             local catalog = Adapter.catalog()
@@ -265,123 +348,229 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             local stat = ({ Stamina = "stamina", ["Spell Power"] = "spellPower", ["Physical Power"] = "physicalPower" })[config.UpgradeStat]
             if points > 0 and stat then Adapter.call("spendSkillPoint", stat, points) end
         end
+        if mode == "Dungeon" then runtime.LastDungeonJob = game.JobId end
         local members = Adapter.members(roster)
         for _, member in ipairs(members) do
             if member.level then runtime.Levels[tostring(member.id)] = member.level end
         end
+        local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
+        local hostPresent = Players:GetPlayerByUserId(host.id) ~= nil
+        local hostState = sync and sync.Member(host.id)
+        local scriptsReady = not sync or sync.Ready(roster)
+        state.party = ready and (equal and "Party present; levels match" or "Party present; progression uses lowest Host/Alt level")
+            or ("Waiting: " .. table.concat(missing, ", "))
         if mode == "Lobby" then
             stop()
+            phase("LOBBY_REFORMING", now)
+            runtime.Transition = nil
             if config.Role ~= "Host" then
-                state.status = config.AutoJoin and ("Requesting " .. host.name) or "Auto join disabled"
-                if config.AutoJoin and due("join", config.JoinInterval, now) and active() then
-                    local ok, reason = Adapter.call("sendJoinRequest", host.name)
-                    if ok == false then state.status = "Join request: " .. tostring(reason or "host not ready") end
+                if not config.AutoJoin then state.status = "Auto join disabled"; return end
+                -- Positive Host PRE_START presence permits requests to the dungeon.
+                -- A completed/returning Host heartbeat explicitly forbids them.
+                local hostJoinable = hostState and hostState.enabled and hostState.ready
+                    and hostState.mode == "Dungeon" and hostState.phase == "PRE_START"
+                    and hostState.jobId ~= runtime.LastDungeonJob
+                state.status = hostJoinable and ("Requesting " .. host.name) or "Lobby reforming: waiting for Host"
+                if due("join", config.JoinInterval, now) and active() then
+                    if hostJoinable then
+                        local ok, reason = Adapter.call("sendJoinRequest", host.name, false)
+                        if ok == false then state.status = "Join request: " .. tostring(reason or "Host not ready") end
+                    elseif not hostState or hostState.mode == "Lobby" and hostState.phase == "LOBBY_REFORMING" then
+                        -- Without transport, assemble in an actual lobby queue and
+                        -- depart together. Never probe a completed dungeon with requests.
+                        local choice = selection(partyLevel(members) or Adapter.level())
+                        local dungeon = hostState and hostState.dungeon and hostState.dungeon.Dungeon
+                            or choice and choice.Dungeon
+                        local _, reason = Adapter.joinLobby(host.name, dungeon, runtime.Catalog)
+                        state.status = reason
+                    else state.status = "Waiting: Host phase " .. tostring(hostState.phase) end
                 end
                 return
             end
             if not config.AutoBest then state.status = "Auto best dungeon disabled"; return end
-            -- Recovery may have left an alt behind. Use its last observed level as an eligibility ceiling.
+            local lobby = Adapter.findLobby()
+            local queued = Adapter.lobbyMembers(lobby)
+            for _, member in ipairs(roster) do
+                local level = queued[member.name:lower()]
+                if type(level) == "number" then runtime.Levels[tostring(member.id)] = level end
+            end
             local level = partyLevel(members) or Adapter.level()
             local chosen = assert(selection(level), "No eligible dungeon; refresh the lobby catalog")
+            if sync then sync.SetPhase("LOBBY_REFORMING", chosen) end
             state.status = "Host: " .. chosen.Dungeon .. " / " .. chosen.Difficulty
             if due("queue", 5, now) and active() then
-                local lobby = Adapter.findLobby()
                 if lobby then
                     if not Adapter.lobbyMatches(lobby, chosen, config) then
-                        Adapter.call("leaveGame")
-                        state.status = "Recreating lobby with selected options"
-                        return
+                        Adapter.call("leaveGame"); state.status = "Recreating lobby with selected options"; return
                     end
                     if config.Whitelist then
                         for _, account in ipairs(roster) do if account.id ~= host.id then Adapter.call("addPlayerToWhitelist", account.name) end end
                     end
-                    if active() then
-                        state.status = "Entering " .. chosen.Dungeon .. " / " .. chosen.Difficulty
-                        assert(Adapter.call("startDungeon") ~= false, "Server declined dungeon entry; retrying")
+                    -- Presence-only fallback has no remote phase evidence: gather
+                    -- everyone in the queue before entering the dungeon.
+                    local queuedMissing = {}
+                    for _, account in ipairs(roster) do
+                        if not queued[account.name:lower()] then table.insert(queuedMissing, account.name) end
                     end
+                    if #queuedMissing > 0 then
+                        state.status = "Lobby reforming: waiting for " .. table.concat(queuedMissing, ", "); return
+                    end
+                    save(); Adapter.call("startDungeon")
+                    state.status = "Entering " .. chosen.Dungeon .. " / " .. chosen.Difficulty
                 else
-                    state.status = "Creating " .. chosen.Dungeon .. " / " .. chosen.Difficulty
-                    assert(Adapter.createLobby(chosen, config), "Server declined dungeon creation; check your level and lobby state")
-                    state.status = "Lobby created; entering shortly"
+                    assert(Adapter.createLobby(chosen, config), "Server declined dungeon creation")
+                    state.status = "Lobby created; gathering selected accounts"
                 end
             end
             return
         end
-        -- Owner metadata is not reliable on first entry or after ownership transfers.
-        -- Role selection controls requests; the server validates owner-only actions.
-        if sync and config.Role ~= "Host" then
-            local regroup = sync.Command()
-            if regroup then returnLobby("Host regroup: " .. regroup, now); return end
+        local command = sync and sync.Command(not hostPresent)
+        if command and command.id ~= runtime.ConsumedTransition
+            and (not state.transition or command.at >= state.transition.at) then
+            runtime.ConsumedTransition = command.id
+            if command.phase == "REPLAYING" then
+                beginTransition("REPLAYING", "Host replay requested; waiting for teleport", now, command)
+            else
+                returnLobby(command.reason, now, command.phase, command); return
+            end
         end
-        processRequests(now)
-        if not active() then return end
-        local ready, equal, missing = Logic.partyReady(members, host.id, carry.id)
-        state.party = ready and (equal and "Party present; host and alts at the same level" or "Party present; waiting for levels to match")
-            or ("Missing: " .. table.concat(missing, ", "))
-        if ready then state.partySeen = true; state.missingAt = nil
-        else state.missingAt = state.missingAt or now end
-        local scriptsReady = not sync or sync.Ready(roster)
-        local canRun = ready and scriptsReady
-        if canRun then state.readyAt = state.readyAt or now else state.readyAt = nil end
-        if state.returning then returnLobby(state.status, now); return end
-        local started = Adapter.PlaceManager.HasDungeonStarted()
-        -- Initial assembly has no timeout. Recover only a party that was assembled
-        -- or a run already in progress, so slow joins do not eject the host.
-        if config.OCD and (state.partySeen or started) and not ready and now - state.missingAt >= config.RecoveryGrace then
-            returnLobby("OCD recovery: regrouping in lobby", now); return
-        end
-        if Adapter.failed() then state.Finish(true)
-        elseif Adapter.finished() then state.Finish() end
-        if state.finishedAt and now - state.finishedAt >= 5 and not state.rewardsRefreshed then
-            healCache = {}; times.inventory = nil; state.rewardsRefreshed = true
-            -- Give every client time to inspect its newly awarded inventory and
-            -- publish the count before the host chooses replay versus progression.
-            if config.ProvisionHeals then state.healsSettlingUntil = now + 2 end
-        end
-        local allHealed, healMissing = false, {}
-        if config.ProvisionHeals then allHealed, healMissing = checkHeals(members, now) end
-        if config.ProvisionHeals then
-            state.party = state.party .. (allHealed and " | Universal Heals ready"
-                or " | Heals missing: " .. table.concat(healMissing, ", "))
-        end
-        if not active() then return end
-        -- Choose for the lowest host/alt level so unequal XP never strands a lower
-        -- account in an old dungeon or sends it somewhere it cannot enter.
-        local eligibleLevel = partyLevel(members)
-        local chosen = eligibleLevel and selection(eligibleLevel, config.ProvisionHeals and allHealed or nil)
-        local current = Adapter.currentDungeon()
-        local switchEnabled = config.Role == "Host" and config.AutoBest
-            or config.Role ~= "Host" and config.AutoSwitch and not config.SyncEnabled
-        local switch = switchEnabled and ready and chosen and not Logic.sameDungeon(chosen, current)
+        if state.returning then processRequests(now); returnLobby(state.returnReason, now); return end
         if state.finished then
             stop()
-            if state.failed then state.status = "Run failed; waiting for the game to return to lobby"; return end
-            -- Let replicated levels and newly awarded drops settle before replay/progression.
-            if now - state.finishedAt < 5 then state.status = "Waiting for rewards"; return end
-            if state.healsSettlingUntil and now < state.healsSettlingUntil then
-                state.status = "Syncing Universal Heal rewards"; return
+            if not state.transition then phase("REWARDS_SETTLING", now) end
+            processRequests(now)
+            if now - state.finishedAt < 5 then state.status = "Rewards settling"; return end
+            if not state.rewardsRefreshed then
+                healCache = {}; times.inventory = nil; state.rewardsRefreshed = true
+                if config.ProvisionHeals then state.healsSettlingUntil = now + 2 end
             end
-            if switch then returnLobby("Progression: " .. chosen.Dungeon .. " / " .. chosen.Difficulty, now); return end
-            state.status = ready and "Run ended; replaying current dungeon" or "Run ended; waiting for party"
-            if config.Role == "Host" and canRun and due("replay", 15, now) and active() then Adapter.replay() end
+            if config.Role ~= "Host" then
+                state.status = state.phase == "REPLAYING" and "Replay requested; waiting for teleport" or "Rewards settled; waiting for Host decision"
+                -- Host departure is the fallback authority signal. A replay command
+                -- suspends this fallback while the game's party teleport completes.
+                if not hostPresent and not state.transition then
+                    state.hostLeftAt = state.hostLeftAt or now
+                    -- Without an explicit decision, departure may be replay.
+                    -- Allow the same bounded grace as an in-flight teleport.
+                    state.status = "Host departed; waiting for party teleport"
+                    local confirmedReturn = hostState and hostState.mode == "Lobby" and hostState.phase == "LOBBY_REFORMING"
+                    if confirmedReturn or now - state.hostLeftAt >= 30 then
+                        returnLobby("Following Host return", now, "PROGRESSION_RETURN")
+                    end
+                elseif state.transition and now - state.transitionAt > 90 then
+                    returnLobby("Replay teleport timed out; regrouping", now)
+                else state.hostLeftAt = nil end
+                return
+            end
+            if state.failed then returnLobby("Run failed: regrouping in lobby", now); return end
+            local allHealed = false
+            if config.ProvisionHeals then allHealed = checkHeals(members, now) end
+            if state.healsSettlingUntil and now < state.healsSettlingUntil then state.status = "Rewards settling: Universal Heals"; return end
+            local eligibleLevel = partyLevel(members)
+            local chosen = eligibleLevel and selection(eligibleLevel, config.ProvisionHeals and allHealed or nil)
+            local dungeon = Adapter.currentDungeon()
+            if not state.transition and config.AutoBest and ready
+                and Logic.shouldProgress(chosen, dungeon, config.ProvisionHeals and allHealed and dungeon.Dungeon == "Pirate Island") then
+                returnLobby("Progression unlocked: returning for " .. chosen.Dungeon .. " / " .. chosen.Difficulty, now, "PROGRESSION_RETURN"); return
+            end
+            if not ready then
+                state.status = "Run complete: " .. state.party
+                if now - state.finishedAt >= config.RecoveryGrace then returnLobby("Replay party incomplete; regrouping", now) end
+                return
+            end
+            if not state.transition then beginTransition("REPLAYING", "Replaying current dungeon", now) end
+            if not announced(now) then state.status = "Announcing current dungeon replay"; return end
+            local attempts = state.replayAttempts or 0
+            if attempts >= 3 and now - (times.replay or now) >= 12 then
+                state.transitionAt = nil
+                returnLobby("Replay failed after 3 attempts; regrouping", now); return
+            end
+            local interval = math.min(12, 4 * 2 ^ math.max(0, attempts - 1))
+            state.status = attempts == 0 and "Replaying current dungeon" or ("Replay requested; waiting for teleport (retry in "
+                .. math.max(0, math.ceil(interval - (now - (times.replay or now)))) .. "s)")
+            if state.replayError then
+                state.status = "Replay failed; retrying in " .. math.max(0, math.ceil(interval - (now - (times.replay or now)))) .. "s: " .. state.replayError
+            end
+            if attempts < 3 and due("replay", interval, now) and active() then
+                state.replayAttempts = attempts + 1
+                runtime.PendingAction = { jobId = game.JobId, phase = "REPLAYING", attempts = state.replayAttempts, at = wallTime() }
+                save()
+                local ok, result, reason = pcall(Adapter.replay)
+                state.replayError = not (ok and result ~= false) and tostring(reason or result) or nil
+                state.status = state.replayError and ("Replay failed; retrying in " .. interval .. "s: " .. state.replayError)
+                    or "Replay requested; waiting for teleport"
+            end
+            return
+        end
+        if state.transition then
+            stop(); processRequests(now)
+            state.status = "Host replay pending; waiting for completion/teleport"
+            if now - state.transitionAt > 90 then returnLobby("Replay timed out; regrouping", now) end
+            return
+        end
+        local started = Adapter.started()
+        if started == nil then phase("ASSEMBLING", now); stop(); state.status = "Waiting for dungeon state replication"; return end
+        if started then state.runStarted = true; state.endingAt = nil
+        elseif state.runStarted then
+            phase("REWARDS_SETTLING", now); stop(); processRequests(now)
+            state.endingAt = state.endingAt or now
+            state.status = "Rewards settling: waiting for completion replication"
+            if config.Role == "Host" and now - state.endingAt >= 30 then
+                returnLobby("Completion state unavailable; regrouping", now)
+            end
+            return
+        end
+        phase(started and "RUNNING" or "PRE_START", now)
+        processRequests(now)
+        local transition = hostState and hostState.jobId == game.JobId and
+            (hostState.phase == "REPLAYING" or hostState.phase == "PROGRESSION_RETURN" or hostState.phase == "RECOVERING")
+        if transition then
+            stop(); state.missingAt, state.partySeen = nil, false
+            state.status = "Waiting for Host transition: " .. hostState.phase; return
+        end
+        -- Only a fully replicated party observed in THIS stable phase arms OCD.
+        local loaded = ready
+        for _, member in ipairs(members) do if not member.level then loaded = false end end
+        if loaded then
+            state.stableAt = state.stableAt or now
+            if now - state.stableAt >= config.StartDelay then state.partySeen = true end
+            state.missingAt = nil
+        elseif not ready and state.partySeen then state.missingAt = state.missingAt or now
+        else state.missingAt = nil; state.stableAt = nil end
+        if not ready then
+            stop()
+            state.readyAt = nil
+            state.status = state.party
+            if config.OCD and state.missingAt then
+                local elapsed = now - state.missingAt
+                state.status = "OCD grace: " .. table.concat(missing, ", ") .. " missing " .. math.floor(elapsed) .. " / " .. config.RecoveryGrace .. "s"
+                if elapsed >= config.RecoveryGrace then
+                    -- Host is the authority; Carry takes over only when Host is lost.
+                    if config.Role == "Host" or not hostPresent and config.Role == "Carry" then
+                        returnLobby("OCD recovery: " .. table.concat(missing, ", "), now)
+                    elseif not hostPresent and not Players:GetPlayerByUserId(carry.id) then
+                        returnLobby("Following party recovery", now)
+                    end
+                end
+            end
             return
         end
         if not started then
             stop()
-            if switch and current.Dungeon == "Pirate Island" and allHealed then
-                returnLobby("Universal Heal ready; selecting best dungeon", now); return
-            end
-            state.status = canRun and "Party ready; waiting to start" or ready and "Waiting for selected scripts through relay" or "Waiting for selected accounts"
-            -- Carry owns Level Kaitun policy; the host mirrors its readiness gate for owner-only servers.
-            if canRun and now - state.readyAt >= config.StartDelay and config.LevelKaitun
-                and (config.Role == "Carry" or config.Role == "Host") and due("start", 5, now) and active() then
-                Adapter.call("changeStartValue")
+            if config.RequireScriptsReady and not scriptsReady then state.readyAt = nil; state.status = sync and sync.status or "Sync transport unavailable"; return end
+            state.readyAt = state.readyAt or now
+            state.status = "Party ready; start delay " .. string.format("%.1f / %.1f", now - state.readyAt, config.StartDelay)
+            if config.Role == "Host" and config.LevelKaitun and now - state.readyAt >= config.StartDelay
+                and due("start", 5, now) and active() then
+                state.status = "Starting dungeon"; Adapter.call("changeStartValue")
             end
             return
         end
+        -- Heartbeat readiness gates START only, never local movement during a run.
+        local canRun = ready
         state.farming = config.Role == "Carry" and config.LevelKaitun and canRun
         controller.SetRunning(state.farming)
-        state.status = state.farming and "Carry: pathfinding farm" or healerRole() and config.AutoHealer and (config.Role .. ": Universal Heal") or "Waiting for carry"
+        state.status = state.farming and "Carry farm active" or healerRole() and config.AutoHealer and (config.Role .. ": Universal Heal") or "Waiting for carry"
         if healerRole() and config.AutoHealer and healer and canRun then
             -- The slot scheduler alternates Q/E and still respects each tool cooldown.
             -- Stagger heals even when both slots are ready after joining or idling.
