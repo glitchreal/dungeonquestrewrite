@@ -21,13 +21,13 @@ end
 function PartySync.new(config, mode, isAlive)
     local Http = game:GetService("HttpService")
     local player = game:GetService("Players").LocalPlayer
-    local sync = { status = "Sync disabled: using presence-only coordination" }
+    local sync = { status = "Sync: checking shared files" }
     local context, response, receivedAt, pending, acknowledged, lastAttempt = nil, nil, nil, nil, false, -math.huge
     local generation, relayBusy = 0, false
     local files = {
         available = type(writefile) == "function" and type(readfile) == "function"
             and type(isfile) == "function" and type(makefolder) == "function",
-        room = nil, shared = false, lastWrite = -math.huge,
+        room = nil, shared = false, ready = false, lastWrite = -math.huge,
     }
 
     local function signature()
@@ -41,7 +41,7 @@ function PartySync.new(config, mode, isAlive)
             lastSignature = value; generation = generation + 1
             context, response, receivedAt, pending, acknowledged = nil, nil, nil, nil, false
             lastAttempt = -math.huge
-            files.room, files.shared, files.lastWrite = nil, false, -math.huge
+            files.room, files.shared, files.ready, files.lastWrite = nil, false, false, -math.huge
         end
     end
     local function ensureFolder(path)
@@ -84,7 +84,7 @@ function PartySync.new(config, mode, isAlive)
         })
     end
     local function fileReadiness(roster)
-        if not files.room then return false, nil end
+        if not files.room then files.ready = false; return false, nil end
         local missing, visible = {}, 0
         for _, account in ipairs(roster) do
             local member = readJSON(heartbeatPath(account.id))
@@ -94,7 +94,8 @@ function PartySync.new(config, mode, isAlive)
                 or member.enabled ~= true or member.ready ~= true then table.insert(missing, account.name) end
         end
         if visible == #roster then files.shared = true end
-        return #missing == 0, missing
+        files.ready = #missing == 0
+        return files.ready, missing
     end
     local function relayReadiness(roster)
         local now = os.clock()
@@ -134,14 +135,14 @@ function PartySync.new(config, mode, isAlive)
         if context then
             context.phase, context.dungeon = phase, dungeon or context.dungeon
             files.lastWrite = -math.huge
-            if config.SyncEnabled then writeHeartbeat(os.clock()) end
+            writeHeartbeat(os.clock())
         end
     end
     function sync.Member(id)
         reset()
-        if not config.SyncEnabled then return nil end
         local member = readJSON(heartbeatPath(id))
         if fresh(member, 3) and member.userId == id then return member end
+        if not config.SyncEnabled then return nil end
         local now = os.clock()
         local limit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 5 or 35
         if response and receivedAt and now - receivedAt <= limit then
@@ -160,23 +161,24 @@ function PartySync.new(config, mode, isAlive)
     end
     function sync.Announce(command)
         reset()
-        if not config.SyncEnabled then return true end
         if not pending or pending.id ~= command.id then
             pending, acknowledged, lastAttempt = command, false, -math.huge
         end
         -- Write before departure even if not every script has been observed yet.
         if writeJSON(commandPath(), command) and files.shared then return true end
+        if not config.SyncEnabled then return true end
         return acknowledged
     end
     function sync.Command(hostAbsent)
         reset()
-        if not config.SyncEnabled or not context then return nil end
+        if not context then return nil end
         local function valid(command)
             return Logic.validCommand(command, context.hostId, context.carryId,
                 game.JobId, game.PlaceId, wallTime(), hostAbsent)
         end
         local command = readJSON(commandPath())
         if valid(command) then return command end
+        if not config.SyncEnabled then return nil end
         local responseLimit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 3 or 20
         if response and receivedAt and os.clock() - receivedAt <= responseLimit and valid(response.command) then
             return response.command
@@ -205,21 +207,20 @@ function PartySync.new(config, mode, isAlive)
     end
     function sync.Ready(roster)
         reset()
-        if not config.SyncEnabled then
-            sync.status = config.RequireScriptsReady and "Sync disabled: enable sync to require selected scripts" or "Sync disabled: using presence-only coordination"
-            return not config.RequireScriptsReady
-        end
         local ready, missing = fileReadiness(roster)
         if ready then sync.status = "Sync healthy: file transport"; return true end
-        local relayReady, relayMissing = relayReadiness(roster)
+        local relayReady, relayMissing = false, nil
+        if config.SyncEnabled then relayReady, relayMissing = relayReadiness(roster) end
         if relayReady then sync.status = "Sync healthy: relay fallback"; return true end
         local waiting = table.concat(relayMissing or missing or {}, ", ")
         if files.shared then
             sync.status = "Sync: heartbeat stale/not ready: " .. waiting
         elseif relayMissing then
             sync.status = "Sync: waiting for " .. waiting .. " heartbeat (relay)"
+        elseif not files.available then
+            sync.status = "Sync unavailable: executor file APIs unavailable"
         else
-            sync.status = "Sync unavailable: shared files unconfirmed (possibly isolated); relay unavailable"
+            sync.status = "Sync: waiting for shared workspace heartbeats"
                 .. (waiting ~= "" and ("; waiting for " .. waiting .. " heartbeat") or "")
         end
         if not config.RequireScriptsReady then
@@ -233,14 +234,13 @@ function PartySync.new(config, mode, isAlive)
         while isAlive() do
             reset()
             local now = os.clock()
-            if not config.SyncEnabled then
-                sync.status = config.RequireScriptsReady and "Sync disabled: selected scripts required" or "Sync disabled: using presence-only coordination"
-            elseif context then
+            if context then
                 writeHeartbeat(now)
                 local url = config.SyncURL:gsub("/+$", "")
                 local kind = relayKind(url)
                 local interval = kind == "local" and 0.5 or 10
-                if not relayBusy and kind and #config.SyncKey >= 32 and now - lastAttempt >= interval then
+                if config.SyncEnabled and not files.ready and not relayBusy and kind and #config.SyncKey >= 32
+                    and now - lastAttempt >= interval then
                     lastAttempt = now
                     local request = request or http_request or (syn and syn.request)
                     if type(request) == "function" then

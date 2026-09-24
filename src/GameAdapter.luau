@@ -67,9 +67,17 @@ function Adapter.identity(token)
     assert(token ~= "", "Enter the host, carry, and selected alt usernames")
     local key = token:lower()
     if identities[key] then return identities[key] end
-    local id = tonumber(token) or Players:GetUserIdFromNameAsync(token)
+    local numericId = tonumber(token)
+    for _, current in ipairs(Players:GetPlayers()) do
+        if numericId == current.UserId or not numericId and current.Name:lower() == key then
+            local result = { id = current.UserId, name = current.Name }
+            identities[key] = result
+            return result
+        end
+    end
+    local id = numericId or Players:GetUserIdFromNameAsync(token)
     assert(id and id > 0 and id % 1 == 0, "Invalid account: " .. token)
-    local result = { id = id, name = Players:GetNameFromUserIdAsync(id) }
+    local result = { id = id, name = numericId and Players:GetNameFromUserIdAsync(id) or token }
     identities[key] = result
     return result
 end

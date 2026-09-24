@@ -1,4 +1,4 @@
--- Shared-workspace party sync: no server, key, or background command required.
+-- Shared-workspace party sync is automatic; no server, key, or background command required.
 getgenv().autoexecute = true
 getgenv().autoloadconfig = true
 getgenv().DQRewriteSync = { Files = true }

@@ -6,7 +6,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local state = { phase = mode == "Lobby" and "LOBBY_REFORMING" or "ASSEMBLING", phaseAt = os.clock(), sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
         finished = false, finishedAt = nil, missingAt = nil, readyAt = nil, returning = false, requests = {}, responded = {} }
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
-    local rosterKey, catalogReady = nil, false
+    local rosterKey, catalogReady, catalogRole = nil, false, nil
     local healer = mode == "Dungeon" and AbilityController.new(player, function() end) or nil
     runtime.Catalog = Logic.catalog(runtime.Catalog)
     runtime.Heals = runtime.Heals or {}
@@ -335,12 +335,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
         end
         if sync then sync.Update(roster, host, carry, true, runtime.Heals[tostring(player.UserId)], state.phase, Adapter.currentDungeon()) end
-        if mode == "Lobby" and not catalogReady then
+        if mode == "Lobby" and (not catalogReady or catalogRole ~= config.Role) then
             state.status = "Loading dungeon requirements"
-            local catalog = Adapter.catalog()
+            -- Followers already have the normal dungeon requirements. Only
+            -- the Host needs the live queue catalog before creating a lobby.
+            local catalog = config.Role == "Host" and Adapter.catalog() or runtime.Catalog
             if not active() then return end
-            runtime.Catalog, catalogReady = catalog, true
-            save()
+            runtime.Catalog, catalogReady, catalogRole = catalog, true, config.Role
+            if config.Role == "Host" then save() end
         end
         if not active() then return end
         if healerRole() and config.AutoSkillPoints and due("points", 3, now) then

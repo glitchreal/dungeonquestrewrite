@@ -317,9 +317,17 @@ function Adapter.identity(token)
     assert(token ~= "", "Enter the host, carry, and selected alt usernames")
     local key = token:lower()
     if identities[key] then return identities[key] end
-    local id = tonumber(token) or Players:GetUserIdFromNameAsync(token)
+    local numericId = tonumber(token)
+    for _, current in ipairs(Players:GetPlayers()) do
+        if numericId == current.UserId or not numericId and current.Name:lower() == key then
+            local result = { id = current.UserId, name = current.Name }
+            identities[key] = result
+            return result
+        end
+    end
+    local id = numericId or Players:GetUserIdFromNameAsync(token)
     assert(id and id > 0 and id % 1 == 0, "Invalid account: " .. token)
-    local result = { id = id, name = Players:GetNameFromUserIdAsync(id) }
+    local result = { id = id, name = numericId and Players:GetNameFromUserIdAsync(id) or token }
     identities[key] = result
     return result
 end
@@ -904,13 +912,13 @@ end
 function PartySync.new(config, mode, isAlive)
     local Http = game:GetService("HttpService")
     local player = game:GetService("Players").LocalPlayer
-    local sync = { status = "Sync disabled: using presence-only coordination" }
+    local sync = { status = "Sync: checking shared files" }
     local context, response, receivedAt, pending, acknowledged, lastAttempt = nil, nil, nil, nil, false, -math.huge
     local generation, relayBusy = 0, false
     local files = {
         available = type(writefile) == "function" and type(readfile) == "function"
             and type(isfile) == "function" and type(makefolder) == "function",
-        room = nil, shared = false, lastWrite = -math.huge,
+        room = nil, shared = false, ready = false, lastWrite = -math.huge,
     }
 
     local function signature()
@@ -924,7 +932,7 @@ function PartySync.new(config, mode, isAlive)
             lastSignature = value; generation = generation + 1
             context, response, receivedAt, pending, acknowledged = nil, nil, nil, nil, false
             lastAttempt = -math.huge
-            files.room, files.shared, files.lastWrite = nil, false, -math.huge
+            files.room, files.shared, files.ready, files.lastWrite = nil, false, false, -math.huge
         end
     end
     local function ensureFolder(path)
@@ -967,7 +975,7 @@ function PartySync.new(config, mode, isAlive)
         })
     end
     local function fileReadiness(roster)
-        if not files.room then return false, nil end
+        if not files.room then files.ready = false; return false, nil end
         local missing, visible = {}, 0
         for _, account in ipairs(roster) do
             local member = readJSON(heartbeatPath(account.id))
@@ -977,7 +985,8 @@ function PartySync.new(config, mode, isAlive)
                 or member.enabled ~= true or member.ready ~= true then table.insert(missing, account.name) end
         end
         if visible == #roster then files.shared = true end
-        return #missing == 0, missing
+        files.ready = #missing == 0
+        return files.ready, missing
     end
     local function relayReadiness(roster)
         local now = os.clock()
@@ -1017,14 +1026,14 @@ function PartySync.new(config, mode, isAlive)
         if context then
             context.phase, context.dungeon = phase, dungeon or context.dungeon
             files.lastWrite = -math.huge
-            if config.SyncEnabled then writeHeartbeat(os.clock()) end
+            writeHeartbeat(os.clock())
         end
     end
     function sync.Member(id)
         reset()
-        if not config.SyncEnabled then return nil end
         local member = readJSON(heartbeatPath(id))
         if fresh(member, 3) and member.userId == id then return member end
+        if not config.SyncEnabled then return nil end
         local now = os.clock()
         local limit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 5 or 35
         if response and receivedAt and now - receivedAt <= limit then
@@ -1043,23 +1052,24 @@ function PartySync.new(config, mode, isAlive)
     end
     function sync.Announce(command)
         reset()
-        if not config.SyncEnabled then return true end
         if not pending or pending.id ~= command.id then
             pending, acknowledged, lastAttempt = command, false, -math.huge
         end
         -- Write before departure even if not every script has been observed yet.
         if writeJSON(commandPath(), command) and files.shared then return true end
+        if not config.SyncEnabled then return true end
         return acknowledged
     end
     function sync.Command(hostAbsent)
         reset()
-        if not config.SyncEnabled or not context then return nil end
+        if not context then return nil end
         local function valid(command)
             return Logic.validCommand(command, context.hostId, context.carryId,
                 game.JobId, game.PlaceId, wallTime(), hostAbsent)
         end
         local command = readJSON(commandPath())
         if valid(command) then return command end
+        if not config.SyncEnabled then return nil end
         local responseLimit = relayKind(config.SyncURL:gsub("/+$", "")) == "local" and 3 or 20
         if response and receivedAt and os.clock() - receivedAt <= responseLimit and valid(response.command) then
             return response.command
@@ -1088,21 +1098,20 @@ function PartySync.new(config, mode, isAlive)
     end
     function sync.Ready(roster)
         reset()
-        if not config.SyncEnabled then
-            sync.status = config.RequireScriptsReady and "Sync disabled: enable sync to require selected scripts" or "Sync disabled: using presence-only coordination"
-            return not config.RequireScriptsReady
-        end
         local ready, missing = fileReadiness(roster)
         if ready then sync.status = "Sync healthy: file transport"; return true end
-        local relayReady, relayMissing = relayReadiness(roster)
+        local relayReady, relayMissing = false, nil
+        if config.SyncEnabled then relayReady, relayMissing = relayReadiness(roster) end
         if relayReady then sync.status = "Sync healthy: relay fallback"; return true end
         local waiting = table.concat(relayMissing or missing or {}, ", ")
         if files.shared then
             sync.status = "Sync: heartbeat stale/not ready: " .. waiting
         elseif relayMissing then
             sync.status = "Sync: waiting for " .. waiting .. " heartbeat (relay)"
+        elseif not files.available then
+            sync.status = "Sync unavailable: executor file APIs unavailable"
         else
-            sync.status = "Sync unavailable: shared files unconfirmed (possibly isolated); relay unavailable"
+            sync.status = "Sync: waiting for shared workspace heartbeats"
                 .. (waiting ~= "" and ("; waiting for " .. waiting .. " heartbeat") or "")
         end
         if not config.RequireScriptsReady then
@@ -1116,14 +1125,13 @@ function PartySync.new(config, mode, isAlive)
         while isAlive() do
             reset()
             local now = os.clock()
-            if not config.SyncEnabled then
-                sync.status = config.RequireScriptsReady and "Sync disabled: selected scripts required" or "Sync disabled: using presence-only coordination"
-            elseif context then
+            if context then
                 writeHeartbeat(now)
                 local url = config.SyncURL:gsub("/+$", "")
                 local kind = relayKind(url)
                 local interval = kind == "local" and 0.5 or 10
-                if not relayBusy and kind and #config.SyncKey >= 32 and now - lastAttempt >= interval then
+                if config.SyncEnabled and not files.ready and not relayBusy and kind and #config.SyncKey >= 32
+                    and now - lastAttempt >= interval then
                     lastAttempt = now
                     local request = request or http_request or (syn and syn.request)
                     if type(request) == "function" then
@@ -1179,7 +1187,7 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
     local state = { phase = mode == "Lobby" and "LOBBY_REFORMING" or "ASSEMBLING", phaseAt = os.clock(), sellStatus = "Auto sell: off", sold = 0, status = "Disabled", party = "Configure host, carry, and alts", farming = false,
         finished = false, finishedAt = nil, missingAt = nil, readyAt = nil, returning = false, requests = {}, responded = {} }
     local times, healCache, roster, host, carry = {}, {}, nil, nil, nil
-    local rosterKey, catalogReady = nil, false
+    local rosterKey, catalogReady, catalogRole = nil, false, nil
     local healer = mode == "Dungeon" and AbilityController.new(player, function() end) or nil
     runtime.Catalog = Logic.catalog(runtime.Catalog)
     runtime.Heals = runtime.Heals or {}
@@ -1508,12 +1516,14 @@ function Roles.new(config, runtime, mode, controller, save, isAlive, sync)
             end
         end
         if sync then sync.Update(roster, host, carry, true, runtime.Heals[tostring(player.UserId)], state.phase, Adapter.currentDungeon()) end
-        if mode == "Lobby" and not catalogReady then
+        if mode == "Lobby" and (not catalogReady or catalogRole ~= config.Role) then
             state.status = "Loading dungeon requirements"
-            local catalog = Adapter.catalog()
+            -- Followers already have the normal dungeon requirements. Only
+            -- the Host needs the live queue catalog before creating a lobby.
+            local catalog = config.Role == "Host" and Adapter.catalog() or runtime.Catalog
             if not active() then return end
-            runtime.Catalog, catalogReady = catalog, true
-            save()
+            runtime.Catalog, catalogReady, catalogRole = catalog, true, config.Role
+            if config.Role == "Host" then save() end
         end
         if not active() then return end
         if healerRole() and config.AutoSkillPoints and due("points", 3, now) then
@@ -2065,7 +2075,9 @@ local function slider(group, key, text, min, max)
     controls[key] = control
 end
 local automation = partyTab:AddLeftGroupbox("Automation")
-toggle(automation, "AutoStartRole", "Auto start role automation on execute")
+toggle(automation, "AutoStartRole", "Auto start role automation on execute", function(value)
+    if value and not C.Enabled and controls.Enabled then controls.Enabled:SetValue(true) end
+end)
 toggle(automation, "Enabled", "Enable role automation", nil, "Starts the selected Carry, Host, or Alt role. Choose Host to create dungeons.")
 automation:AddLabel("Select your account role and fill in the party below. Host creates dungeons; carry and alts request the host.", true)
 local roleAutomation = roleTab:AddLeftGroupbox("Automation")
@@ -2081,11 +2093,11 @@ input(setup, "Alts", "Selected alts (paste list)", function(value)
 end, "Paste usernames or user IDs separated by newlines, spaces, tabs, commas, or semicolons. Press Enter or click away to format the list and remove duplicates.")
 setup:AddLabel("Party list and role settings are shared on this executor workspace. Reload each account to detect its role. Host and alts level together.", true)
 local syncGroup = partyTab:AddLeftGroupbox("Cross-client sync")
-toggle(syncGroup, "SyncEnabled", "Enable cross-client sync", nil, "Exchanges party phases and heartbeats. Does not enable or disable local Carry combat.")
+toggle(syncGroup, "SyncEnabled", "Enable optional relay fallback", nil, "Shared executor files sync automatically. Turn this on only when using an HTTP relay for clients with separate workspaces.")
 toggle(syncGroup, "RequireScriptsReady", "Require selected scripts ready before start", nil, "Waits for every selected heartbeat before starting. Turn off to use player presence when transport is unavailable.")
 input(syncGroup, "SyncURL", "Optional relay fallback URL")
 input(syncGroup, "SyncKey", "Private relay key")
-syncGroup:AddLabel("Same-device clients first try heartbeat files in the executor workspace. No command or local server is needed when those files are shared.", true)
+syncGroup:AddLabel("Shared executor files sync automatically. A relay is only needed when the clients cannot read each other's files.", true)
 local syncLabel = syncGroup:AddLabel("Sync: checking transport", true)
 local options = partyTab:AddRightGroupbox("Run options")
 toggle(options, "Hardcore", "Hardcore (host)")

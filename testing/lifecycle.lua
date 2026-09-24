@@ -8,7 +8,7 @@ local Logic = dofile('src/HubLogic.luau')
 local tests = 0
 local function check(name, fn) fn(); tests=tests+1; print('PASS '..name) end
 local function fixture(role, mode)
-    local world = { now=0, started=false, complete=false, calls={}, running=false, ready=true, present={[1]=true,[2]=true,[3]=true},
+    local world = { now=0, started=false, complete=false, calls={}, catalogCalls=0, running=false, ready=true, present={[1]=true,[2]=true,[3]=true},
         level=156, dungeon={Dungeon='Volcanic Chambers',Difficulty='Nightmare',levelReq=155} }
     local ids={Host=1,Carry=2,Alt=3}
     local player={UserId=ids[role],Name=role}
@@ -19,7 +19,9 @@ local function fixture(role, mode)
     local Adapter={level=function() return world.level end,value=function(_,_,fallback) return fallback end,
         roster=function() return roster,roster[1],roster[2] end,currentDungeon=function() return world.dungeon end,
         started=function() return world.started end,finished=function() return world.complete end,failed=function() return false end,
-        ownerId=function() return 1 end,pendingRequests=function() return {} end,catalog=function() return Logic.catalog() end,
+        ownerId=function() return 1 end,pendingRequests=function() return {} end,catalog=function() world.catalogCalls=world.catalogCalls+1;return Logic.catalog() end,
+        findLobby=function() return nil end,lobbyMembers=function() return {} end,
+        createLobby=function() world.calls[#world.calls+1]={'createLobby'};return true end,
         members=function() local out={}; for _,a in ipairs(roster) do out[#out+1]={id=a.id,name=a.name,present=world.present[a.id],level=world.present[a.id] and world.level} end; return out end,
         call=function(name,...) world.calls[#world.calls+1]={name,...}; return true end,
         replay=function() world.calls[#world.calls+1]={'replayDungeon'}; return true end,
@@ -72,6 +74,13 @@ end)
 check('presence-only join uses actual lobby interface',function()
     local w,_,c=fixture('Alt','Lobby');c.SyncEnabled=false;w.tick(0)
     assert(w.count('joinLobby')==1 and w.count('sendJoinRequest')==0)
+end)
+check('followers join without loading the live dungeon catalog',function()
+    for _,role in ipairs({'Carry','Alt'}) do
+        local w=fixture(role,'Lobby');w.tick(0)
+        assert(w.catalogCalls==0 and w.count('joinLobby')==1)
+    end
+    local host=fixture('Host','Lobby');host.tick(0);assert(host.catalogCalls==1)
 end)
 check('Carry runs with missing heartbeat once dungeon started',function()
     for _,enabled in ipairs({true,false}) do

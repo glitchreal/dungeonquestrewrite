@@ -17,8 +17,9 @@ Paste the whole alt list using newlines, spaces, tabs, commas, or semicolons, th
 press Enter or click away. The field formats it with commas and removes duplicate entries.
 User IDs also work; display names do not. Select each account's
 role, choose its options, and enable **Auto start role automation on execute** in each
-role profile for unattended execution. **Enable role automation** and **Start selected
-role** still control the current session. Dungeon creation requires the
+role profile for unattended execution; turning it on also starts that role now.
+**Enable role automation** and **Start selected role** still control the current
+session. Dungeon creation requires the
 **Host** role; Carry and Alt join the Host queue, or send requests only to a Host confirmed in PRE_START. Party fields save as
 you type, and the visible text is captured again before reload/unload/teleport.
 Role automation pauses while you edit the party to avoid using partial usernames.
@@ -95,12 +96,14 @@ sell, OCD recovery, UI hiding, CPU saver, automatic settings, and teleport conti
 Three independent settings control execution:
 
 - **Auto start role automation on execute**: saved in each Carry/Host/Alt profile.
-- **Enable cross-client sync**: exchanges phases, heartbeats, and transitions.
+- **Enable optional relay fallback**: uses a configured HTTP relay only when shared
+  executor files are unavailable. Local file heartbeats and transitions work automatically.
 - **Require selected scripts ready before start**: gates starting the dungeon,
   never Carry movement in an already-running dungeon.
 
-`files.luau` enables file transport only. Shared executor files are checked first;
-configured HTTP relay is a fallback. A missing heartbeat reports the account, and
+`main.luau` uses shared executor files automatically; `files.luau` remains a
+file-only entry point that clears any saved relay settings. A configured HTTP
+relay is a fallback. A missing heartbeat reports the account, and
 an unproven shared workspace reports possible isolation/relay unavailability.
 With script readiness disabled, unavailable transport uses presence-only policy.
 With script readiness required, the Host waits and shows the missing evidence.
