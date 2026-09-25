@@ -488,8 +488,20 @@ end
 -- PlaceManager has no IsDungeonOwner in the inspected client. The game's replay
 -- UI checks teleport.ownerId; prefer replicated active ownership when available.
 function Adapter.started()
-    if Adapter.value(workspace, "dungeonStarted", nil) == nil then return nil end
-    return PM.HasDungeonStarted()
+    -- PlaceManager treats an absent dungeonStarted flag as started once the
+    -- client is in the Level place. The flag is not present during some
+    -- cloud-phone joins, so converting that valid state to nil strands the
+    -- Host in ASSEMBLING and prevents the start remote from firing.
+    local placeName
+    if type(PM.GetPlaceName) == "function" then
+        pcall(function() placeName = PM.GetPlaceName() end)
+    end
+    if placeName and placeName ~= "Level" then return nil end
+    local ok, started = pcall(PM.HasDungeonStarted)
+    if ok and type(started) == "boolean" then return started end
+    local marker = Adapter.value(workspace, "dungeonStarted", nil)
+    if marker ~= nil then return marker == true end
+    return placeName == "Level" and true or nil
 end
 
 function Adapter.replay()
@@ -3060,8 +3072,12 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             warn("[EnemyWalker] path error: " .. tostring(path))
             return
         end
+        -- A cleared-room route deliberately has no combat target. Do not
+        -- dereference target.Parent in that case: the old callback died after
+        -- the first kill, leaving the carry standing still until a reload.
+        local targetValid = target == nil or isValidTarget(target) and target:IsDescendantOf(Workspace)
         if state.closed or not state.running or humanoid.Health <= 0 or generation ~= state.pathGeneration
-            or player.Character ~= rootPart.Parent or not target.Parent
+            or player.Character ~= rootPart.Parent or not targetValid
             or not state.motionGoal or (state.motionGoal - goal).Magnitude > 8 then
             if path then path:Destroy() end
             return

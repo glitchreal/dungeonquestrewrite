@@ -113,3 +113,9 @@ driven AoE planner. Those systems were retained. A bounded `NavigationMemory` la
 now adds decaying confidence weighted route-edge, boss-spacing, and recovery evidence
 without overriding current geometry. Live mechanic labels expose beam, colored-orb,
 jump-slam, and projectile-corridor state; current hazards remain authoritative.
+
+## Cloud-phone lifecycle fixes — 2026-09-24
+
+- `Adapter.started()` now preserves the inspected `PlaceManager.HasDungeonStarted()` contract: an absent `dungeonStarted` flag is a valid started Level state. The previous nil conversion left the Host in `ASSEMBLING` and blocked automatic start on clients where that flag is omitted during join.
+- Cleared-room navigation no longer crashes its asynchronous path callback when the combat target has just been killed. Route advancement intentionally passes `target = nil`; the callback now validates a target only when one exists, so the carry can continue to the next checkpoint or wave.
+- `lua build.lua`, both generated bundle parses, `git diff --check`, and the existing focused lifecycle/profile/navigation/sync fixtures pass.

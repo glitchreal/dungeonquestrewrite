@@ -1016,8 +1016,12 @@ local function followGoal(humanoid, rootPart, goal, mode, now, target)
             warn("[EnemyWalker] path error: " .. tostring(path))
             return
         end
+        -- A cleared-room route deliberately has no combat target. Do not
+        -- dereference target.Parent in that case: the old callback died after
+        -- the first kill, leaving the carry standing still until a reload.
+        local targetValid = target == nil or isValidTarget(target) and target:IsDescendantOf(Workspace)
         if state.closed or not state.running or humanoid.Health <= 0 or generation ~= state.pathGeneration
-            or player.Character ~= rootPart.Parent or not target.Parent
+            or player.Character ~= rootPart.Parent or not targetValid
             or not state.motionGoal or (state.motionGoal - goal).Magnitude > 8 then
             if path then path:Destroy() end
             return
