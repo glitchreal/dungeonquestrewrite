@@ -611,7 +611,7 @@ local function finishAdaptiveTarget(now, terminal)
     if now - (entry.startedAt or now) < 1.25 then reward = reward * 0.5 end
     adaptive:observe(entry.targetContext, entry.targetAction, reward)
     adaptive:observe(entry.rangeContext, entry.rangeAction, reward)
-    navigation:observe("spacing|" .. tostring(game.PlaceId) .. "|" .. kind, entry.rangeAction, reward, now)
+    navigation:observe("spacing|" .. tostring(game.PlaceId) .. "|" .. (entry.kind or "mob"), entry.rangeAction, reward, now)
     state.adaptiveTarget = nil
 end
 
@@ -626,6 +626,7 @@ local function beginAdaptiveTarget(target, humanoid, now)
     local rangeContext = "range|" .. tostring(game.PlaceId) .. "|" .. kind
     state.adaptiveTarget = {
         target = target,
+        kind = kind,
         targetContext = adaptiveTargetContext() .. "|" .. kind,
         targetAction = state.targetStrategy or "visible",
         rangeContext = rangeContext,
