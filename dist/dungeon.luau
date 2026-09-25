@@ -5155,15 +5155,21 @@ coordinator = Roles.new(C, runtime, MODE, controller, save, function() return al
 env.DungeonQuestObsidian = { Config = C, Runtime = runtime, Controller = controller, Coordinator = coordinator,
     Library = Library, Sync = partySync, Boosts = boosts, Unload = unload, Errors = errors, Mode = MODE }
 local teleportQueued = false
+local function queueContinuation()
+    if env.autoexecute == false or teleportQueued or type(queueTeleport) ~= "function" then return false end
+    local url = env.DQObsidianLoaderURL or "https://raw.githubusercontent.com/glitchreal/dungeonquestrewrite/main/main.luau"
+    local queued = string.format("getgenv().autoexecute=true\ngetgenv().autoloadconfig=%s\ngetgenv().DQRewriteResume=game:GetService('HttpService'):JSONDecode(%q)\nassert(loadstring(game:HttpGet(%q)))()",
+        tostring(env.autoloadconfig ~= false), HttpService:JSONEncode(snapshot()), url)
+    local ok = pcall(queueTeleport, queued)
+    if ok then teleportQueued = true end
+    return ok
+end
+queueContinuation()
 connect(player.OnTeleport, function(state)
     if state == Enum.TeleportState.Failed then teleportQueued = false; coordinator.TeleportFailed(); return end
     if state ~= Enum.TeleportState.Started then return end
     coordinator.TeleportStarted(); save()
-    if env.autoexecute == false or teleportQueued or type(queueTeleport) ~= "function" then return end
-    local url = env.DQObsidianLoaderURL or "https://raw.githubusercontent.com/glitchreal/dungeonquestrewrite/main/main.luau"
-    local queued = string.format("getgenv().autoexecute=true\ngetgenv().autoloadconfig=%s\ngetgenv().DQRewriteResume=game:GetService('HttpService'):JSONDecode(%q)\nassert(loadstring(game:HttpGet(%q)))()",
-        tostring(env.autoloadconfig ~= false), HttpService:JSONEncode(snapshot()), url)
-    queueTeleport(queued); teleportQueued = true
+    queueContinuation()
 end)
 if MODE == "Dungeon" then
     local requests = Adapter.Remotes:FindFirstChild("showJoinRequest")
